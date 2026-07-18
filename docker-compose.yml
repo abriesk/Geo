@@ -1,0 +1,146 @@
+# geohazard-chat — Docker Compose (§4.1)
+# M0 scope: everything boots, healthchecks pass, queues + schema exist.
+#
+# LLM service note (§4.1): Ollama runs *external* by default (set
+# OLLAMA_BASE_URL in .env, e.g. a Proxmox VM with the RTX 3050 passed
+# through). To run it as a sidecar instead, uncomment the `llm` service
+# below and point OLLAMA_BASE_URL at http://llm:11434.
+
+name: geohazard-chat
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: geohazard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: geohazard
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Migrations run automatically on FIRST init of an empty data dir.
+      # For later migrations on an existing DB: docker compose exec db
+      #   psql -U geohazard -d geohazard -f /migrations/NNN_xxx.sql
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geohazard -d geohazard"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  broker:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: geohazard
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?set in .env}
+    ports:
+      - "15672:15672"   # management UI (operator convenience; remove if exposed)
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: services/backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://geohazard:${POSTGRES_PASSWORD}@db:5432/geohazard
+      AMQP_URL: amqp://geohazard:${RABBITMQ_DEFAULT_PASS}@broker:5672/%2F
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_MODEL: ${LLM_MODEL:-llama3.1:8b-instruct-q5_K_M}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      MAX_AOI_KM2: ${MAX_AOI_KM2:-1000}
+      MAX_AOI_KM2_EXPERT: ${MAX_AOI_KM2_EXPERT:-5000}
+      EXPERT_RAW_PROCESSING: ${EXPERT_RAW_PROCESSING:-false}
+      DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-30}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys,json; d=json.load(urllib.request.urlopen('http://localhost:8000/health',timeout=4)); sys.exit(0 if d['healthy'] else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: services/frontend/Dockerfile
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  downloader:
+    build:
+      context: .
+      dockerfile: services/downloader/Dockerfile
+    environment:
+      SERVICE_ROLE: downloader
+      AMQP_URL: amqp://geohazard:${RABBITMQ_DEFAULT_PASS}@broker:5672/%2F
+      DATABASE_URL: postgresql://geohazard:${POSTGRES_PASSWORD}@db:5432/geohazard
+      CDSE_USERNAME: ${CDSE_USERNAME:-}
+      CDSE_PASSWORD: ${CDSE_PASSWORD:-}
+      EARTHDATA_USERNAME: ${EARTHDATA_USERNAME:-}
+      EARTHDATA_PASSWORD: ${EARTHDATA_PASSWORD:-}
+      DOWNLOAD_CONCURRENCY: ${DOWNLOAD_CONCURRENCY:-2}
+    volumes:
+      - ./data:/data
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      SERVICE_ROLE: worker
+      AMQP_URL: amqp://geohazard:${RABBITMQ_DEFAULT_PASS}@broker:5672/%2F
+      DATABASE_URL: postgresql://geohazard:${POSTGRES_PASSWORD}@db:5432/geohazard
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      SCRATCH_MIN_FREE_GB: ${SCRATCH_MIN_FREE_GB:-100}
+      EXPERT_RAW_PROCESSING: ${EXPERT_RAW_PROCESSING:-false}
+    volumes:
+      - ./data:/data
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # llm:
+  #   image: ollama/ollama:latest
+  #   volumes:
+  #     - ollama:/root/.ollama        # keep on SSD (§4.2 storage split)
+  #   ports:
+  #     - "11434:11434"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   restart: unless-stopped
+
+volumes:
+  pgdata:      # §4.2: keep on SSD
+  rabbitmq:    # §4.2: keep on SSD
+  # ollama:

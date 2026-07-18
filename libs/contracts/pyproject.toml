@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geohazard-contracts"
+version = "0.1.0"
+description = "Normative contracts (Technical Reference v2 SS6) for geohazard-chat"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-only"}
+dependencies = [
+    "pydantic>=2.5",
+    "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+queues = ["pika>=1.3"]
+
+[tool.setuptools.packages.find]
+include = ["geohazard_contracts*"]

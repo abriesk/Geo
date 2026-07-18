@@ -1,0 +1,204 @@
+{
+  "$defs": {
+    "Artifact": {
+      "additionalProperties": false,
+      "properties": {
+        "caption": {
+          "title": "Caption",
+          "type": "string"
+        },
+        "path": {
+          "description": "Relative to the wrapper's --output-dir",
+          "title": "Path",
+          "type": "string"
+        },
+        "type": {
+          "description": "e.g. \"map_png\", \"timeseries_png\"",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "caption"
+      ],
+      "title": "Artifact",
+      "type": "object"
+    },
+    "Confidence": {
+      "enum": [
+        "low",
+        "moderate",
+        "high"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "Method": {
+      "enum": [
+        "egms",
+        "licsbas",
+        "mintpy",
+        "floodpy",
+        "ndvi"
+      ],
+      "title": "Method",
+      "type": "string"
+    },
+    "QualityBlock": {
+      "additionalProperties": false,
+      "description": "Feeds the LLM's confidence language (\u00a75.4, \u00a78.3).",
+      "properties": {
+        "caveats": {
+          "description": "Machine-generated; passed to the LLM verbatim (\u00a76.3)",
+          "items": {
+            "type": "string"
+          },
+          "title": "Caveats",
+          "type": "array"
+        },
+        "cloud_fraction": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cloud Fraction"
+        },
+        "coherence_mean": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Coherence Mean"
+        },
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "date_coverage": {
+          "items": {
+            "format": "date",
+            "type": "string"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "title": "Date Coverage",
+          "type": "array"
+        },
+        "masked_fraction": {
+          "anyOf": [
+            {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Masked Fraction"
+        },
+        "scene_count": {
+          "minimum": 0,
+          "title": "Scene Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scene_count",
+        "date_coverage",
+        "confidence"
+      ],
+      "title": "QualityBlock",
+      "type": "object"
+    },
+    "ResultStatus": {
+      "enum": [
+        "ok",
+        "partial",
+        "failed"
+      ],
+      "title": "ResultStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Schema for result.json emitted by every wrapper (\u00a76.3).",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/Artifact"
+      },
+      "title": "Artifacts",
+      "type": "array"
+    },
+    "attribution": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Attribution",
+      "type": "array"
+    },
+    "method": {
+      "$ref": "#/$defs/Method"
+    },
+    "quality": {
+      "$ref": "#/$defs/QualityBlock"
+    },
+    "query_id": {
+      "format": "uuid",
+      "title": "Query Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/ResultStatus"
+    },
+    "summary_stats": {
+      "additionalProperties": {
+        "additionalProperties": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "type": "object"
+      },
+      "description": "Per-group flat numeric/string stats, e.g. {\"deformation\": {\"velocity_mm_yr_mean_aoi\": -4.7, \"trend\": \"subsiding\"}}",
+      "title": "Summary Stats",
+      "type": "object"
+    }
+  },
+  "required": [
+    "query_id",
+    "method",
+    "status",
+    "quality"
+  ],
+  "title": "ResultJson",
+  "type": "object"
+}

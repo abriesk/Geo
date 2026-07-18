@@ -1,0 +1,55 @@
+{
+  "additionalProperties": false,
+  "description": "results queue (\u00a76.4).",
+  "properties": {
+    "error": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Error"
+    },
+    "query_id": {
+      "format": "uuid",
+      "title": "Query Id",
+      "type": "string"
+    },
+    "result_json_path": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Result Json Path"
+    },
+    "status": {
+      "enum": [
+        "done",
+        "failed"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "task_id": {
+      "format": "uuid",
+      "title": "Task Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query_id",
+    "task_id",
+    "status"
+  ],
+  "title": "ResultMessage",
+  "type": "object"
+}

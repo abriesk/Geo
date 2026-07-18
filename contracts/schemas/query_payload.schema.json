@@ -1,0 +1,107 @@
+{
+  "$defs": {
+    "AoiPolygon": {
+      "additionalProperties": false,
+      "description": "GeoJSON Polygon, EPSG:4326, lon-lat, RHR winding (\u00a76.1).",
+      "properties": {
+        "coordinates": {
+          "description": "[[ [lon, lat], ... ]] \u2014 exterior ring; holes are ignored/rejected",
+          "items": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "title": "Coordinates",
+          "type": "array"
+        },
+        "type": {
+          "const": "Polygon",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "coordinates"
+      ],
+      "title": "AoiPolygon",
+      "type": "object"
+    },
+    "DateRange": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        }
+      },
+      "title": "DateRange",
+      "type": "object"
+    },
+    "Depth": {
+      "enum": [
+        "quick",
+        "standard",
+        "thorough"
+      ],
+      "title": "Depth",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "POST /query body (\u00a76.1).",
+  "properties": {
+    "aoi": {
+      "$ref": "#/$defs/AoiPolygon"
+    },
+    "dates": {
+      "$ref": "#/$defs/DateRange"
+    },
+    "depth": {
+      "$ref": "#/$defs/Depth",
+      "default": "standard"
+    },
+    "expert_raw": {
+      "default": false,
+      "title": "Expert Raw",
+      "type": "boolean"
+    },
+    "question": {
+      "minLength": 1,
+      "title": "Question",
+      "type": "string"
+    }
+  },
+  "required": [
+    "question",
+    "aoi"
+  ],
+  "title": "QueryPayload",
+  "type": "object"
+}

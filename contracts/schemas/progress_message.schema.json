@@ -1,0 +1,47 @@
+{
+  "additionalProperties": false,
+  "description": "progress queue (\u00a76.4). Wrappers emit 'PROGRESS <int> <message>' lines\non stdout; the worker relays them here (\u00a75.4).",
+  "properties": {
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "percent": {
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Percent",
+      "type": "integer"
+    },
+    "query_id": {
+      "format": "uuid",
+      "title": "Query Id",
+      "type": "string"
+    },
+    "task_id": {
+      "anyOf": [
+        {
+          "format": "uuid",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Task Id"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "query_id",
+    "message",
+    "percent",
+    "ts"
+  ],
+  "title": "ProgressMessage",
+  "type": "object"
+}

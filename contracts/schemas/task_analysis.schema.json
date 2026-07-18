@@ -1,0 +1,123 @@
+{
+  "$defs": {
+    "AoiPolygon": {
+      "additionalProperties": false,
+      "description": "GeoJSON Polygon, EPSG:4326, lon-lat, RHR winding (\u00a76.1).",
+      "properties": {
+        "coordinates": {
+          "description": "[[ [lon, lat], ... ]] \u2014 exterior ring; holes are ignored/rejected",
+          "items": {
+            "items": {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "title": "Coordinates",
+          "type": "array"
+        },
+        "type": {
+          "const": "Polygon",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "coordinates"
+      ],
+      "title": "AoiPolygon",
+      "type": "object"
+    },
+    "DateRange": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "format": "date",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        }
+      },
+      "title": "DateRange",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "tasks queue, kind=analysis (\u00a76.4).",
+  "properties": {
+    "aoi": {
+      "$ref": "#/$defs/AoiPolygon"
+    },
+    "dates": {
+      "$ref": "#/$defs/DateRange"
+    },
+    "input_dir": {
+      "title": "Input Dir",
+      "type": "string"
+    },
+    "kind": {
+      "const": "analysis",
+      "default": "analysis",
+      "title": "Kind",
+      "type": "string"
+    },
+    "name": {
+      "description": "wrapper name, e.g. \"wrap_licsbas\"",
+      "title": "Name",
+      "type": "string"
+    },
+    "output_dir": {
+      "title": "Output Dir",
+      "type": "string"
+    },
+    "params": {
+      "additionalProperties": true,
+      "title": "Params",
+      "type": "object"
+    },
+    "query_id": {
+      "format": "uuid",
+      "title": "Query Id",
+      "type": "string"
+    },
+    "task_id": {
+      "format": "uuid",
+      "title": "Task Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "query_id",
+    "name",
+    "input_dir",
+    "output_dir",
+    "aoi",
+    "dates"
+  ],
+  "title": "AnalysisTaskMessage",
+  "type": "object"
+}
