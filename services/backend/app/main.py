@@ -1,4 +1,4 @@
-"""geohazard-chat backend — M1.1 (walking skeleton, backend half).
+"""geohazard-chat backend — M1.2 (walking skeleton complete: LLM synthesis).
 
 Flow implemented here (§7 steps 1-2, 4-6 with a template instead of the LLM):
   POST /query -> validate -> persist -> routing stub (always one dummy
@@ -29,6 +29,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 
+from . import llm
 from geohazard_contracts import (
     AnalysisTaskMessage,
     ProgressMessage,
@@ -95,18 +96,27 @@ def _template_answer(question: str, results: list[dict], failures: list[dict]) -
     return "\n".join(lines)
 
 
-def _finalize_query_if_done(conn, query_id: str) -> None:
-    tasks = conn.execute(
-        "SELECT name, status, result_path, error FROM tasks WHERE query_id = %s",
-        (query_id,),
-    ).fetchall()
-    if not tasks or any(t["status"] in ("queued", "running") for t in tasks):
-        return
+def _finalize_query_if_done(query_id: str) -> None:
+    """Phase 1 (short DB txn): check terminal, mark summarizing, gather inputs.
+    Phase 2 (no DB held): LLM synthesis, may take tens of seconds (§8.2).
+    Phase 3 (short DB txn): store answer + final status.
+    Falls back to the deterministic template if the LLM is unreachable —
+    a dead GPU box must never hang or fail a query (§8 failure policy)."""
+    with _db() as conn:
+        tasks = conn.execute(
+            "SELECT name, status, result_path, error FROM tasks WHERE query_id = %s",
+            (query_id,),
+        ).fetchall()
+        if not tasks or any(t["status"] in ("queued", "running") for t in tasks):
+            return
+        conn.execute(
+            "UPDATE queries SET status=%s WHERE query_id=%s",
+            (QueryStatus.SUMMARIZING.value, query_id),
+        )
+        q = conn.execute(
+            "SELECT question FROM queries WHERE query_id=%s", (query_id,)
+        ).fetchone()
 
-    conn.execute(
-        "UPDATE queries SET status=%s WHERE query_id=%s",
-        (QueryStatus.SUMMARIZING.value, query_id),
-    )
     results, failures = [], []
     for t in tasks:
         if t["status"] == "done" and t["result_path"]:
@@ -117,15 +127,22 @@ def _finalize_query_if_done(conn, query_id: str) -> None:
         else:
             failures.append({"name": t["name"], "error": t["error"]})
 
-    q = conn.execute(
-        "SELECT question FROM queries WHERE query_id=%s", (query_id,)
-    ).fetchone()
-    answer = _template_answer(q["question"], results, failures)
+    try:
+        answer = llm.synthesize_answer(q["question"], results, failures)
+        print(f"[backend] query {query_id}: LLM synthesis ok", flush=True)
+    except llm.LlmUnavailable as e:
+        print(f"[backend] query {query_id}: LLM unavailable ({e}); template fallback", flush=True)
+        answer = (
+            "⚠ The language model was unreachable; this is an automatic raw summary.\n\n"
+            + _template_answer(q["question"], results, failures)
+        )
+
     final = QueryStatus.DONE if results else QueryStatus.FAILED
-    conn.execute(
-        "UPDATE queries SET status=%s, answer=%s WHERE query_id=%s",
-        (final.value, answer, query_id),
-    )
+    with _db() as conn:
+        conn.execute(
+            "UPDATE queries SET status=%s, answer=%s WHERE query_id=%s",
+            (final.value, answer, query_id),
+        )
     print(f"[backend] query {query_id} finalized: {final.value}", flush=True)
 
 
@@ -149,6 +166,7 @@ def _on_progress(channel, method, properties, body: bytes) -> None:
 
 
 def _on_result(channel, method, properties, body: bytes) -> None:
+    msg = None
     try:
         msg = ResultMessage.model_validate_json(body)
         with _db() as conn:
@@ -161,10 +179,17 @@ def _on_result(channel, method, properties, body: bytes) -> None:
                     msg.task_id,
                 ),
             )
-            _finalize_query_if_done(conn, str(msg.query_id))
     except Exception as e:  # noqa: BLE001
         print(f"[backend] bad result message dropped: {e}", flush=True)
+    # Ack BEFORE synthesis: the LLM call can exceed the AMQP heartbeat
+    # window; a dropped connection after this point must not redeliver.
+    # Crash-during-synthesis leaves status=summarizing (M5 adds a sweeper).
     channel.basic_ack(delivery_tag=method.delivery_tag)
+    if msg is not None:
+        try:
+            _finalize_query_if_done(str(msg.query_id))
+        except Exception as e:  # noqa: BLE001
+            print(f"[backend] finalize failed for {msg.query_id}: {e!r}", flush=True)
 
 
 def _consumer_loop() -> None:
@@ -186,7 +211,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="geohazard-chat backend", version="0.2.0-m1.1", lifespan=lifespan)
+app = FastAPI(title="geohazard-chat backend", version="0.3.0-m1.2", lifespan=lifespan)
 Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=RESULTS_ROOT), name="files")
 
@@ -206,6 +231,7 @@ def health():
         status["broker"] = "ok"
     except Exception as e:  # noqa: BLE001
         status["broker"] = f"error: {e}"
+    status["llm"] = llm.llm_reachable()  # informational only (§8 fallback exists)
     healthy = status["db"].startswith("ok") and status["broker"] == "ok"
     return {"healthy": healthy, "services": status}
 

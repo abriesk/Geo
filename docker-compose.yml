@@ -1,10 +1,9 @@
 # geohazard-chat — Docker Compose (§4.1)
-# M0 scope: everything boots, healthchecks pass, queues + schema exist.
+# M1.2: full walking skeleton (map/chat UI + LLM synthesis).
 #
-# LLM service note (§4.1): Ollama runs *external* by default (set
-# OLLAMA_BASE_URL in .env, e.g. a Proxmox VM with the RTX 3050 passed
-# through). To run it as a sidecar instead, uncomment the `llm` service
-# below and point OLLAMA_BASE_URL at http://llm:11434.
+# LLM (§4.1/§6.6): external OpenAI-compatible server (koboldcpp on the LLM
+# host) reached via LLM_BASE_URL. The old Ollama sidecar option is retired;
+# any OpenAI-compatible server works.
 
 name: geohazard-chat
 
@@ -51,9 +50,11 @@ services:
     environment:
       DATABASE_URL: postgresql://geohazard:${POSTGRES_PASSWORD}@db:5432/geohazard
       AMQP_URL: amqp://geohazard:${RABBITMQ_DEFAULT_PASS}@broker:5672/%2F
-      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
-      LLM_MODEL: ${LLM_MODEL:-llama3.1:8b-instruct-q5_K_M}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai_compatible}
+      LLM_BASE_URL: ${LLM_BASE_URL:?set in .env}
+      LLM_API_KEY: ${LLM_API_KEY:-not-needed}
+      LLM_MODEL: ${LLM_MODEL:?set in .env}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-90}
       MAX_AOI_KM2: ${MAX_AOI_KM2:-1000}
       MAX_AOI_KM2_EXPERT: ${MAX_AOI_KM2_EXPERT:-5000}
       EXPERT_RAW_PROCESSING: ${EXPERT_RAW_PROCESSING:-false}
@@ -125,22 +126,6 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # llm:
-  #   image: ollama/ollama:latest
-  #   volumes:
-  #     - ollama:/root/.ollama        # keep on SSD (§4.2 storage split)
-  #   ports:
-  #     - "11434:11434"
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: 1
-  #             capabilities: [gpu]
-  #   restart: unless-stopped
-
 volumes:
   pgdata:      # §4.2: keep on SSD
   rabbitmq:    # §4.2: keep on SSD
-  # ollama:
