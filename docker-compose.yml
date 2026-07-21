@@ -59,10 +59,12 @@ services:
       MAX_AOI_KM2_EXPERT: ${MAX_AOI_KM2_EXPERT:-5000}
       EXPERT_RAW_PROCESSING: ${EXPERT_RAW_PROCESSING:-false}
       DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS:-30}
+      LICSAR_FRAMES_GEOJSON: /static/licsar_frames.geojson
     ports:
       - "8000:8000"
     volumes:
       - ./data:/data
+      - ./static:/static:ro
     depends_on:
       db:
         condition: service_healthy
@@ -101,8 +103,10 @@ services:
       EARTHDATA_USERNAME: ${EARTHDATA_USERNAME:-}
       EARTHDATA_PASSWORD: ${EARTHDATA_PASSWORD:-}
       DOWNLOAD_CONCURRENCY: ${DOWNLOAD_CONCURRENCY:-2}
+      LICSAR_FRAMES_GEOJSON: /static/licsar_frames.geojson
     volumes:
       - ./data:/data
+      - ./static:/static:ro
     depends_on:
       broker:
         condition: service_healthy
