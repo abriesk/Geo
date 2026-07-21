@@ -1,0 +1,70 @@
+{
+  "type": "FeatureCollection",
+  "name": "licsar_frames",
+  "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "frame_id": "014A_05210_131313",
+        "track": 14,
+        "orbit": "A",
+        "note": "Placeholder ascending frame covering greater Yerevan / Ararat valley. Replace with real COMET ID + footprint."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [43.80, 39.70],
+            [45.10, 39.70],
+            [45.10, 40.60],
+            [43.80, 40.60],
+            [43.80, 39.70]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "frame_id": "021D_05180_131313",
+        "track": 21,
+        "orbit": "D",
+        "note": "Placeholder descending frame covering greater Yerevan / Ararat valley. Replace with real COMET ID + footprint."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [43.70, 39.65],
+            [45.20, 39.65],
+            [45.20, 40.55],
+            [43.70, 40.55],
+            [43.70, 39.65]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "frame_id": "087A_04890_131313",
+        "track": 87,
+        "orbit": "A",
+        "note": "Broader Caucasus placeholder (partial overlap with test AOI)."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [43.00, 39.00],
+            [46.50, 39.00],
+            [46.50, 41.50],
+            [43.00, 41.50],
+            [43.00, 39.00]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -17,6 +17,7 @@ from .enums import (
     Trend,
 )
 from .geometry import AoiValidationError, aoi_area_km2, aoi_hash, canonical_aoi_geojson
+from .licsar_frames import FrameMatch, find_frames, find_frames_for_point
 from .messages import (
     AnalysisTaskMessage,
     DownloadTaskMessage,
@@ -26,13 +27,15 @@ from .messages import (
 from .query import AoiPolygon, DateRange, QueryPayload, DEFAULT_LOOKBACK_MONTHS
 from .result import Artifact, QualityBlock, ResultJson
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AnalysisTaskMessage", "AoiPolygon", "AoiValidationError", "Artifact",
     "Confidence", "DateRange", "Depth", "DownloadTaskMessage", "DownloadTier",
-    "DEFAULT_LOOKBACK_MONTHS", "HazardType", "Method", "ProgressMessage",
-    "QualityBlock", "QueryPayload", "QueryStatus", "ResultJson", "ResultMessage",
-    "ResultStatus", "TaskKind", "TaskStatus", "Trend",
+    "DEFAULT_LOOKBACK_MONTHS", "FrameMatch", "HazardType", "Method",
+    "ProgressMessage", "QualityBlock", "QueryPayload", "QueryStatus",
+    "ResultJson", "ResultMessage", "ResultStatus", "TaskKind", "TaskStatus",
+    "Trend",
     "aoi_area_km2", "aoi_hash", "canonical_aoi_geojson",
+    "find_frames", "find_frames_for_point",
 ]
