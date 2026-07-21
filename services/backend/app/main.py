@@ -281,7 +281,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="geohazard-chat backend", version="0.6.0-m2.3", lifespan=lifespan)
+app = FastAPI(title="geohazard-chat backend", version="0.8.0-m3.3", lifespan=lifespan)
 Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=RESULTS_ROOT), name="files")
 
@@ -292,11 +292,52 @@ app.mount("/files", StaticFiles(directory=RESULTS_ROOT), name="files")
 # clarification) + depth fan-out. All hazards still run the dummy wrapper;
 # M2.3/M3/M4 swap in real wrapper names per hazard.
 HAZARD_TO_WRAPPER = {
-    "deformation": "wrap_dummy",   # M3: routing ladder -> wrap_egms/licsbas/...
+    "deformation": "wrap_licsbas", # M3.2: real InSAR
     "flood": "wrap_dummy",         # M4: wrap_floodpy
-    "vegetation": "wrap_ndvi",    # M2.3: live
+    "vegetation": "wrap_dummy",    # M2.3: wrap_ndvi
 }
 DEPTH_MAX_METHODS = {"quick": 1, "standard": 2, "thorough": len(HAZARD_TO_WRAPPER)}
+
+
+# M3.2: InSAR frame configuration. wrap_licsbas is self-downloading (no
+# downloader chain); it needs a LiCSAR frame id in params. Automated AOI->frame
+# resolution is a backlog item (needs a frames catalog); for now a configured
+# default frame is used for deformation queries (the Yerevan test frame).
+DEFAULT_DEFORM_FRAME = os.environ.get("DEFAULT_DEFORM_FRAME", "")
+LICSAR_CATALOG = os.environ.get("LICSAR_CATALOG", "/data/licsar_frames.geojson")
+
+
+def _resolve_deform_frames(aoi_geojson: dict) -> list[str]:
+    """AOI -> LiCSAR frame id(s) from the shipped catalog (§ frame resolution).
+    Falls back to DEFAULT_DEFORM_FRAME when the catalog is absent or misses."""
+    try:
+        import sys as _sys
+        if "/libs" not in _sys.path:
+            _sys.path.insert(0, "/libs")
+        from licsar.frames import find_licsar_frames
+        frames = find_licsar_frames(aoi_geojson, catalog_path=LICSAR_CATALOG)
+        ids = [f["frame_id"] for f in frames]
+        if ids:
+            print(f"[router] resolved {len(ids)} InSAR frame(s): {ids}", flush=True)
+            return ids
+        print("[router] no catalog frame matched AOI", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[router] frame resolution error ({e!r}); using fallback", flush=True)
+    if DEFAULT_DEFORM_FRAME:
+        print(f"[router] fallback frame {DEFAULT_DEFORM_FRAME}", flush=True)
+        return [DEFAULT_DEFORM_FRAME]
+    return []
+
+
+def _deform_params(question: str, aoi_geojson: dict) -> dict:
+    p = {"hazard": "deformation", "simulate_failure": "FAIL!" in question}
+    frames = _resolve_deform_frames(aoi_geojson)
+    if frames:
+        # MVP: run the best (first) frame — ascending, largest overlap. Running
+        # asc+desc as two tasks is a straightforward extension (BACKLOG).
+        p["frame_id"] = frames[0]
+        p["candidate_frames"] = frames
+    return p
 
 
 NEEDS_DOWNLOAD = {
@@ -398,12 +439,15 @@ def _route_and_enqueue(query_id: uuid.UUID, payload: QueryPayload) -> None:
                     # M3 generalizes this linkage).
                     deferred_rows.append((uuid.uuid4(), wrapper))
             else:
+                params = ({"hazard": hazard,
+                           "simulate_failure": "FAIL!" in payload.question}
+                          if hazard != "deformation"
+                          else _deform_params(payload.question, payload.aoi.model_dump()))
                 analysis_msgs.append(AnalysisTaskMessage(
                     task_id=uuid.uuid4(), name=wrapper,
                     input_dir="/data/scratch",
                     output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
-                    params={"hazard": hazard,
-                            "simulate_failure": "FAIL!" in payload.question},
+                    params=params,
                     **common,
                 ))
 

@@ -85,16 +85,63 @@ _PARROT = re.compile(
 )
 
 
+# Lines that begin a meta / self-critique / rule-grading block. Everything
+# from the FIRST such line to the end is dropped — a small local model
+# sometimes appends a rubric self-evaluation after the real answer (observed
+# live M3.2: a "### Critique:" section quoting the rules). None of these
+# markers occurs in a legitimate geohazard answer.
+_META_SECTION = re.compile(
+    r"(?i)^\s*(#{1,6}\s*)?("
+    r"critique|self-?(critique|assessment|evaluation|review)|"
+    r"rule\s*\d|let me (check|re-?read|verify|re-?check)|"
+    r"i think the critique|in your response,? you|you (violated|satisfied|met|followed)|"
+    r"wait,? the critique|checking (the )?rules?)\b"
+)
+
+
+def _truncate_meta(lines: list[str]) -> list[str]:
+    for i, ln in enumerate(lines):
+        if _META_SECTION.match(ln):
+            return lines[:i]
+    return lines
+
+
+def _dedup(lines: list[str]) -> list[str]:
+    """Collapse a looped answer: if the first substantial line recurs verbatim
+    later, the model restarted its answer — cut at the recurrence (observed
+    live M3.2/M3.4: the answer repeated ~4x with 'Here is the...' splices)."""
+    anchor_idx = next((i for i, ln in enumerate(lines) if len(ln.strip()) >= 30), None)
+    if anchor_idx is None:
+        return lines
+    anchor = lines[anchor_idx].strip()
+    for j in range(anchor_idx + 1, len(lines)):
+        if lines[j].strip() == anchor:
+            return lines[:j]
+    return lines
+
+
 def _sanitize(text: str) -> str:
     """Deterministic backstop for §8.3 rules 9-10: small local models leak
-    meta-commentary despite the prompt (observed live in M2.3). Strips
-    word-count lines anywhere and rule-referencing preamble lines at the top."""
+    meta-commentary despite the prompt (observed live M2.3/M3.2). Strips
+    word-count lines anywhere, leading rule/parrot preamble, and truncates any
+    trailing self-critique / rule-grading section."""
     lines = [ln for ln in text.splitlines() if not _META_LINE.search(ln)]
+    lines = _dedup(lines)
+    lines = _truncate_meta(lines)
+    # strip leading preamble / parrot lines
     while lines and (
         (_PREAMBLE.search(lines[0]) and lines[0].rstrip().endswith(":"))
         or _PARROT.match(lines[0])
     ):
         lines.pop(0)
+    # strip trailing blank / preamble / parrot lines (e.g. a dangling
+    # "Here is the plain-language answer:" left by a truncated loop)
+    while lines and (
+        not lines[-1].strip()
+        or _PARROT.match(lines[-1])
+        or (_PREAMBLE.search(lines[-1]) and lines[-1].rstrip().endswith(":"))
+    ):
+        lines.pop()
     while lines and not lines[0].strip():
         lines.pop(0)
     return "\n".join(lines).strip()

@@ -52,7 +52,7 @@ AMQP_URL = os.environ.get("AMQP_URL", "amqp://guest:guest@broker:5672/%2F")
 DUMMY_STEP_SECONDS = float(os.environ.get("DUMMY_STEP_SECONDS", "2"))
 RETRY_HEADER = "x-retry-count"
 WRAPPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrappers")
-REAL_WRAPPERS = {"wrap_ndvi"}  # M3 adds wrap_licsbas etc.
+REAL_WRAPPERS = {"wrap_ndvi", "wrap_licsbas"}
 
 
 def log(msg: str) -> None:
@@ -139,8 +139,13 @@ def run_wrapper_subprocess(task: AnalysisTaskMessage, emit) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".geojson", delete=False) as f:
         json.dump(task.aoi.model_dump(), f)
         aoi_path = f.name
+    # wrap_licsbas runs under the dedicated licsbas conda env (Py3.10 + GDAL);
+    # other wrappers use the base env interpreter.
+    interpreter = sys.executable
+    if task.name == "wrap_licsbas":
+        interpreter = os.environ.get("LICSBAS_PYTHON", sys.executable)
     cmd = [
-        sys.executable, os.path.join(WRAPPER_DIR, f"{task.name}.py"),
+        interpreter, os.path.join(WRAPPER_DIR, f"{task.name}.py"),
         "--query-id", str(task.query_id),
         "--aoi", aoi_path,
         "--dates", f"{task.dates.start},{task.dates.end}",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "geohazard-contracts"
 version = "0.2.0"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = ["pydantic>=2.5", "shapely>=2.0"]
 [tool.setuptools.packages.find]
 include = ["geohazard_contracts*"]

@@ -7,3 +7,4 @@ data/archive/
 data/scratch/
 data/results/
 !data/.gitkeep
+data/_catalog_ckpt/

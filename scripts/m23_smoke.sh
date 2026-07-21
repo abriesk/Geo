@@ -14,10 +14,18 @@ watch() {
   for i in $(seq 1 120); do
     sleep 15
     D=$(curl -s localhost:8000/status/$1)
-    S=$(echo "$D" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])')
-    P=$(echo "$D" | python3 -c 'import sys,json;p=json.load(sys.stdin)["progress"];print(p[-1]["message"][:70] if p else "-")')
-    echo "  $S | $P"
-    [ "$S" = "done" ] && break; [ "$S" = "failed" ] && break
+    S=$(printf '%s' "$D" | python3 -c '
+import sys,json
+raw = sys.stdin.buffer.read()
+try:
+    d = json.loads(raw.decode("utf-8", "replace"))
+    p = d.get("progress") or []
+    print(d.get("status","?"), "|", (p[-1]["message"][:70] if p else "-"))
+except Exception as e:
+    print("UNPARSEABLE:", e); sys.stderr.write(repr(raw[:400])+"\n")
+' )
+    echo "  $S"
+    case "$S" in done*|failed*|needs_clarification*) break;; esac
   done
 }
 
