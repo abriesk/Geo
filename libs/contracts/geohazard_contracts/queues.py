@@ -1,17 +1,18 @@
-"""RabbitMQ topology (§5.6).
+"""RabbitMQ topology (§5.6, amended M2.2).
 
-Queues `tasks`, `progress`, `results`: durable, manual ack.
-`tasks` dead-letters to `tasks.dlq` (poison-message protection).
-Per-message retry limit (3) is enforced by consumers reading the
-x-death header before requeue/reject — that logic lands with the
-real consumers (M1+); the topology is fixed here.
+Kind-split task queues: `tasks.analysis` (worker) and `tasks.download`
+(downloader), both durable, manual ack, dead-lettering to `tasks.dlq`.
+`progress` and `results` unchanged. Message contracts (§6.4) unchanged.
 
-Every service declares this topology idempotently at startup, so
-boot order doesn't matter.
+Every service declares this topology idempotently at startup.
+Migration note: the pre-M2.2 `tasks` queue is left untouched by this code;
+delete it manually once drained:
+  docker compose exec broker rabbitmqctl delete_queue tasks
 """
 from __future__ import annotations
 
-TASKS_QUEUE = "tasks"
+ANALYSIS_QUEUE = "tasks.analysis"
+DOWNLOAD_QUEUE = "tasks.download"
 PROGRESS_QUEUE = "progress"
 RESULTS_QUEUE = "results"
 TASKS_DLQ = "tasks.dlq"
@@ -19,18 +20,14 @@ TASKS_DLQ = "tasks.dlq"
 MAX_TASK_RETRIES = 3  # §5.6 / §7 error path
 PREFETCH_COUNT = 1    # §5.6, worker & downloader consumers
 
+_DLQ_ARGS = {"x-dead-letter-exchange": "", "x-dead-letter-routing-key": TASKS_DLQ}
+
 
 def declare_topology(channel) -> None:
     """Idempotently declare all queues on a pika channel."""
     channel.queue_declare(queue=TASKS_DLQ, durable=True)
-    channel.queue_declare(
-        queue=TASKS_QUEUE,
-        durable=True,
-        arguments={
-            "x-dead-letter-exchange": "",
-            "x-dead-letter-routing-key": TASKS_DLQ,
-        },
-    )
+    channel.queue_declare(queue=ANALYSIS_QUEUE, durable=True, arguments=dict(_DLQ_ARGS))
+    channel.queue_declare(queue=DOWNLOAD_QUEUE, durable=True, arguments=dict(_DLQ_ARGS))
     channel.queue_declare(queue=PROGRESS_QUEUE, durable=True)
     channel.queue_declare(queue=RESULTS_QUEUE, durable=True)
 

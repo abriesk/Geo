@@ -1,4 +1,4 @@
-"""geohazard-chat backend — M1.2 (walking skeleton complete: LLM synthesis).
+"""geohazard-chat backend — M2.2 (cache-aware routing + download chaining).
 
 Flow implemented here (§7 steps 1-2, 4-6 with a template instead of the LLM):
   POST /query -> validate -> persist -> routing stub (always one dummy
@@ -32,6 +32,7 @@ from psycopg.rows import dict_row
 from . import llm
 from geohazard_contracts import (
     AnalysisTaskMessage,
+    DownloadTaskMessage,
     ProgressMessage,
     QueryPayload,
     QueryStatus,
@@ -39,9 +40,10 @@ from geohazard_contracts import (
     TaskStatus,
 )
 from geohazard_contracts.queues import (
+    ANALYSIS_QUEUE,
+    DOWNLOAD_QUEUE,
     PROGRESS_QUEUE,
     RESULTS_QUEUE,
-    TASKS_QUEUE,
     connect_and_declare,
 )
 
@@ -187,9 +189,77 @@ def _on_result(channel, method, properties, body: bytes) -> None:
     channel.basic_ack(delivery_tag=method.delivery_tag)
     if msg is not None:
         try:
-            _finalize_query_if_done(str(msg.query_id))
+            _after_task_terminal(str(msg.query_id), str(msg.task_id))
         except Exception as e:  # noqa: BLE001
-            print(f"[backend] finalize failed for {msg.query_id}: {e!r}", flush=True)
+            print(f"[backend] post-result handling failed for {msg.query_id}: {e!r}", flush=True)
+
+
+def _after_task_terminal(query_id: str, task_id: str) -> None:
+    """§7 step 4: a finished DOWNLOAD task triggers its query's pending
+    analysis tasks (rebuilt from the queries row); a failed download fails
+    them. Then the usual all-terminal finalize check runs."""
+    with _db() as conn:
+        t = conn.execute(
+            "SELECT kind, status, result_path, error FROM tasks WHERE task_id=%s",
+            (task_id,),
+        ).fetchone()
+    if t and t["kind"] == "download":
+        if t["status"] == "done":
+            _publish_pending_analyses(query_id, t["result_path"])
+        else:
+            with _db() as conn:
+                conn.execute(
+                    """UPDATE tasks SET status=%s, error=%s
+                       WHERE query_id=%s AND kind='analysis' AND status=%s""",
+                    (TaskStatus.FAILED.value,
+                     f"input data unavailable: {t['error']}",
+                     query_id, TaskStatus.QUEUED.value),
+                )
+    _finalize_query_if_done(query_id)
+
+
+def _publish_pending_analyses(query_id: str, input_dir: str) -> None:
+    """Rebuild AnalysisTaskMessages for still-queued analysis tasks of the
+    query. M2.2 scope: the only download-gated hazard is vegetation."""
+    from geohazard_contracts import AoiPolygon as _Aoi, DateRange as _DR
+
+    with _db() as conn:
+        q = conn.execute(
+            "SELECT question, aoi, dates_start, dates_end FROM queries WHERE query_id=%s",
+            (query_id,),
+        ).fetchone()
+        pending = conn.execute(
+            """SELECT task_id, name FROM tasks
+               WHERE query_id=%s AND kind='analysis' AND status=%s""",
+            (query_id, TaskStatus.QUEUED.value),
+        ).fetchall()
+    if not q or not pending:
+        return
+
+    aoi_raw = q["aoi"] if not isinstance(q["aoi"], str) else json.loads(q["aoi"])
+    hazard = "vegetation"  # M2.2: sole download-gated hazard; M3 generalizes
+    import pika
+
+    conn_mq, channel = connect_and_declare(AMQP_URL)
+    for row in pending:
+        msg = AnalysisTaskMessage(
+            task_id=row["task_id"], query_id=uuid.UUID(query_id),
+            name=row["name"], input_dir=input_dir,
+            output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
+            aoi=_Aoi.model_validate(aoi_raw),
+            dates=_DR(start=q["dates_start"], end=q["dates_end"]),
+            params={"hazard": hazard,
+                    "simulate_failure": "FAIL!" in (q["question"] or "")},
+        )
+        channel.basic_publish(exchange="", routing_key=ANALYSIS_QUEUE,
+                              body=msg.model_dump_json(),
+                              properties=pika.BasicProperties(delivery_mode=2))
+    conn_mq.close()
+    with _db() as conn:
+        conn.execute("UPDATE queries SET status=%s WHERE query_id=%s",
+                     (QueryStatus.ANALYZING.value, query_id))
+    print(f"[backend] query {query_id}: download done -> {len(pending)} analysis task(s) released",
+          flush=True)
 
 
 def _consumer_loop() -> None:
@@ -211,9 +281,182 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="geohazard-chat backend", version="0.3.0-m1.2", lifespan=lifespan)
+app = FastAPI(title="geohazard-chat backend", version="0.6.0-m2.3", lifespan=lifespan)
 Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=RESULTS_ROOT), name="files")
+
+
+
+# ---------------------------------------------------------------- router (M2.1)
+# §5.2 responsibilities 1-2 (partial): intent parse (LLM, rule fallback,
+# clarification) + depth fan-out. All hazards still run the dummy wrapper;
+# M2.3/M3/M4 swap in real wrapper names per hazard.
+HAZARD_TO_WRAPPER = {
+    "deformation": "wrap_dummy",   # M3: routing ladder -> wrap_egms/licsbas/...
+    "flood": "wrap_dummy",         # M4: wrap_floodpy
+    "vegetation": "wrap_ndvi",    # M2.3: live
+}
+DEPTH_MAX_METHODS = {"quick": 1, "standard": 2, "thorough": len(HAZARD_TO_WRAPPER)}
+
+
+NEEDS_DOWNLOAD = {
+    # hazard -> (cached product_type, download tier, products list, default lookback months §6.1)
+    "vegetation": ("s2", "cdse", ["S2_MSI_L2A"], 12),
+}
+
+
+def _effective_dates(dates, lookback_months: int):
+    """§6.1: null dates -> per-hazard default lookback."""
+    from datetime import date as _date, timedelta as _td
+    end = dates.end or _date.today()
+    start = dates.start or (end - _td(days=30 * lookback_months))
+    return start, end
+
+
+def _cache_lookup(a_hash: str, product_type: str, start, end):
+    """§6.2 probe: same AOI hash, requested range within cached range.
+    Returns the cached data dir (str) or None; touches last_accessed."""
+    with _db() as conn:
+        row = conn.execute(
+            """SELECT id, file_paths FROM cached_data
+               WHERE aoi_hash=%s AND product_type=%s
+                 AND dates_start<=%s AND dates_end>=%s
+               ORDER BY last_accessed DESC LIMIT 1""",
+            (a_hash, product_type, start, end),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("UPDATE cached_data SET last_accessed=now() WHERE id=%s", (row["id"],))
+    fp = row["file_paths"]
+    if isinstance(fp, str):
+        fp = json.loads(fp)
+    return fp.get("dir")
+
+
+def _resolve_intent(question: str) -> list[str]:
+    """LLM first; rule fallback on failure or low confidence (§5.2)."""
+    try:
+        hazards, conf = llm.parse_intent(question)
+        if hazards and conf >= llm.INTENT_CONFIDENCE_THRESHOLD:
+            print(f"[router] LLM intent: {hazards} (conf {conf:.2f})", flush=True)
+            return hazards
+        print(f"[router] LLM low-confidence ({hazards}, {conf:.2f}); trying rules", flush=True)
+    except llm.IntentParseFailed as e:
+        print(f"[router] LLM intent parse failed ({e}); trying rules", flush=True)
+    hazards = llm.rule_intent(question)
+    print(f"[router] rule intent: {hazards}", flush=True)
+    return hazards
+
+
+def _route_and_enqueue(query_id: uuid.UUID, payload: QueryPayload) -> None:
+    try:
+        hazards = _resolve_intent(payload.question)
+
+        if not hazards:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE queries SET status=%s, answer=%s WHERE query_id=%s",
+                    (QueryStatus.NEEDS_CLARIFICATION.value, llm.CLARIFICATION_TEXT, query_id),
+                )
+            print(f"[router] query {query_id}: needs_clarification", flush=True)
+            return
+
+        hazards = hazards[: DEPTH_MAX_METHODS.get(payload.depth.value, 2)]
+
+        analysis_msgs, download_msgs, deferred_rows = [], [], []
+        for hazard in hazards:
+            wrapper = HAZARD_TO_WRAPPER[hazard]
+            common = dict(
+                query_id=query_id,
+                aoi=payload.aoi,
+                dates=payload.dates,
+            )
+            if hazard in NEEDS_DOWNLOAD:
+                product_type, tier, products, lookback = NEEDS_DOWNLOAD[hazard]
+                eff_start, eff_end = _effective_dates(payload.dates, lookback)
+                a_hash = payload.aoi.hash()
+                cached = _cache_lookup(a_hash, product_type, eff_start, eff_end)
+                if cached:
+                    print(f"[router] cache HIT s2 for {a_hash[:12]}… -> skip download", flush=True)
+                    analysis_msgs.append(AnalysisTaskMessage(
+                        task_id=uuid.uuid4(), name=wrapper,
+                        input_dir=cached, output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
+                        params={"hazard": hazard,
+                                "simulate_failure": "FAIL!" in payload.question},
+                        **common,
+                    ))
+                else:
+                    print(f"[router] cache MISS s2 for {a_hash[:12]}… -> download via {tier}", flush=True)
+                    from geohazard_contracts import DateRange as _DR
+                    download_msgs.append(DownloadTaskMessage(
+                        task_id=uuid.uuid4(), tier=tier, products=products,
+                        query_id=query_id, aoi=payload.aoi,
+                        dates=_DR(start=eff_start, end=eff_end),
+                    ))
+                    # Analysis row exists now but its message is built & published
+                    # only when the download completes (M2.2: vegetation only;
+                    # M3 generalizes this linkage).
+                    deferred_rows.append((uuid.uuid4(), wrapper))
+            else:
+                analysis_msgs.append(AnalysisTaskMessage(
+                    task_id=uuid.uuid4(), name=wrapper,
+                    input_dir="/data/scratch",
+                    output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
+                    params={"hazard": hazard,
+                            "simulate_failure": "FAIL!" in payload.question},
+                    **common,
+                ))
+
+        with _db() as conn:
+            for t in analysis_msgs:
+                conn.execute(
+                    """INSERT INTO tasks (task_id, query_id, kind, name, status)
+                       VALUES (%s,%s,'analysis',%s,%s)""",
+                    (t.task_id, query_id, t.name, TaskStatus.QUEUED.value),
+                )
+            for d in download_msgs:
+                conn.execute(
+                    """INSERT INTO tasks (task_id, query_id, kind, name, status)
+                       VALUES (%s,%s,'download',%s,%s)""",
+                    (d.task_id, query_id, f"download_{d.tier.value}", TaskStatus.QUEUED.value),
+                )
+            for task_id, wrapper in deferred_rows:
+                conn.execute(
+                    """INSERT INTO tasks (task_id, query_id, kind, name, status)
+                       VALUES (%s,%s,'analysis',%s,%s)""",
+                    (task_id, query_id, wrapper, TaskStatus.QUEUED.value),
+                )
+
+        import pika
+
+        conn_mq, channel = connect_and_declare(AMQP_URL)
+        for t in analysis_msgs:
+            channel.basic_publish(exchange="", routing_key=ANALYSIS_QUEUE,
+                                  body=t.model_dump_json(),
+                                  properties=pika.BasicProperties(delivery_mode=2))
+        for d in download_msgs:
+            channel.basic_publish(exchange="", routing_key=DOWNLOAD_QUEUE,
+                                  body=d.model_dump_json(),
+                                  properties=pika.BasicProperties(delivery_mode=2))
+        conn_mq.close()
+
+        new_status = QueryStatus.DOWNLOADING if download_msgs else QueryStatus.ANALYZING
+        with _db() as conn:
+            conn.execute("UPDATE queries SET status=%s WHERE query_id=%s",
+                         (new_status.value, query_id))
+        print(f"[router] query {query_id}: {len(analysis_msgs)} analysis + "
+              f"{len(download_msgs)} download task(s) enqueued -> {new_status.value}", flush=True)
+    except Exception as e:  # noqa: BLE001 — routing must never leave a query stuck
+        print(f"[router] routing failed for {query_id}: {e!r}", flush=True)
+        try:
+            with _db() as conn:
+                conn.execute(
+                    "UPDATE queries SET status=%s, answer=%s WHERE query_id=%s",
+                    (QueryStatus.FAILED.value,
+                     f"Internal routing error: {e!r}", query_id),
+                )
+        except Exception as e2:  # noqa: BLE001
+            print(f"[router] could not mark {query_id} failed: {e2!r}", flush=True)
 
 
 @app.get("/health")
@@ -255,21 +498,6 @@ def submit_query(payload: QueryPayload):
         )
 
     query_id = uuid.uuid4()
-    task_id = uuid.uuid4()
-    output_dir = f"{RESULTS_ROOT}/{query_id}/dummy"
-
-    # M1 routing stub (§11 M1): always one deformation analysis task.
-    # M2 replaces this block with LLM intent parse -> §3 ladder -> fan-out.
-    task_msg = AnalysisTaskMessage(
-        task_id=task_id,
-        query_id=query_id,
-        name="wrap_dummy",
-        input_dir="/data/scratch",
-        output_dir=output_dir,
-        aoi=payload.aoi,
-        dates=payload.dates,
-        params={"simulate_failure": "FAIL!" in payload.question},  # test hook
-    )
 
     with _db() as conn:
         conn.execute(
@@ -287,43 +515,13 @@ def submit_query(payload: QueryPayload):
                 QueryStatus.ROUTING.value,
             ),
         )
-        conn.execute(
-            """INSERT INTO tasks (task_id, query_id, kind, name, status)
-               VALUES (%s,%s,'analysis','wrap_dummy',%s)""",
-            (task_id, query_id, TaskStatus.QUEUED.value),
-        )
 
-    try:
-        import pika
-
-        conn_mq, channel = connect_and_declare(AMQP_URL)
-        channel.basic_publish(
-            exchange="",
-            routing_key=TASKS_QUEUE,
-            body=task_msg.model_dump_json(),
-            properties=pika.BasicProperties(delivery_mode=2),
-        )
-        conn_mq.close()
-        with _db() as conn:
-            conn.execute(
-                "UPDATE queries SET status=%s WHERE query_id=%s",
-                (QueryStatus.ANALYZING.value, query_id),
-            )
-        status = QueryStatus.ANALYZING
-    except Exception as e:  # noqa: BLE001 — broker down: query stays queued in DB
-        print(f"[backend] enqueue failed for {query_id}: {e!r}", flush=True)
-        with _db() as conn:
-            conn.execute(
-                "UPDATE queries SET status=%s WHERE query_id=%s",
-                (QueryStatus.FAILED.value, query_id),
-            )
-            conn.execute(
-                "UPDATE tasks SET status=%s, error=%s WHERE task_id=%s",
-                (TaskStatus.FAILED.value, f"enqueue failed: {e!r}", task_id),
-            )
-        raise HTTPException(status_code=503, detail="task broker unavailable, try again")
-
-    return {"query_id": str(query_id), "status": status.value}
+    # §5.2: POST /query returns immediately; routing (which includes an LLM
+    # call) happens off the request path.
+    threading.Thread(
+        target=_route_and_enqueue, args=(query_id, payload), daemon=True
+    ).start()
+    return {"query_id": str(query_id), "status": QueryStatus.ROUTING.value}
 
 
 @app.get("/status/{query_id}")
@@ -360,7 +558,7 @@ def query_result(query_id: uuid.UUID):
         ).fetchone()
         if q is None:
             raise HTTPException(status_code=404, detail="unknown query_id")
-        if q["status"] not in ("done", "failed"):
+        if q["status"] not in ("done", "failed", "needs_clarification"):
             raise HTTPException(status_code=409, detail=f"query is still {q['status']}")
         tasks = conn.execute(
             "SELECT name, status, result_path, error FROM tasks WHERE query_id=%s",

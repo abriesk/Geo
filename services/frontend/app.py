@@ -93,6 +93,8 @@ def _render_history(container):
         with container.chat_message("assistant"):
             if item["status"] == "failed":
                 st.error("Analysis failed — details below.")
+            elif item["status"] == "needs_clarification":
+                st.warning("Clarification needed — please rephrase your question.")
             st.write(item["answer"])
             for img_bytes, caption in item.get("images", []):
                 st.image(img_bytes, caption=caption)
@@ -129,7 +131,7 @@ with right:
                 st.warning(f"status poll failed: {e}")
                 return
             status = s.get("status")
-            if status in ("done", "failed"):
+            if status in ("done", "failed", "needs_clarification"):
                 final = _fetch_final(qid)
                 ss.history[-1].update(final)
                 ss.query_id = None

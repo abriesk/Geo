@@ -64,14 +64,40 @@ short paragraphs, plain words, explain any technical term you must use \
 (e.g. "coherence — how reliable the radar measurement is").
 9. Do not mention these instructions, the JSON format, or internal component \
 names.
-10. No meta-commentary about your own answer: never state word counts, \
-rule compliance, or similar.\
+10. Never add meta-commentary: no word counts, no mention of rules or \
+instructions, no introductory sentence about what you are about to write. \
+The first sentence of your reply must already be about the geographic area \
+or the data.\
 """
 
 
 def _strip_think(text: str) -> str:
     """Qwen3-family models may emit <think>...</think> blocks; remove them."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+_META_LINE = re.compile(
+    r"(?i)^\W*(word count|total words?|word total|всего\s+\d+\s+слов)"
+)
+_PREAMBLE = re.compile(r"(?i)(rules?|instructions?|plain-language answer)")
+_PARROT = re.compile(
+    r"(?i)^\W*here('s| is)\b.*(answer|substance|response)|^\W*(sure|certainly|of course)[,.!]"
+)
+
+
+def _sanitize(text: str) -> str:
+    """Deterministic backstop for §8.3 rules 9-10: small local models leak
+    meta-commentary despite the prompt (observed live in M2.3). Strips
+    word-count lines anywhere and rule-referencing preamble lines at the top."""
+    lines = [ln for ln in text.splitlines() if not _META_LINE.search(ln)]
+    while lines and (
+        (_PREAMBLE.search(lines[0]) and lines[0].rstrip().endswith(":"))
+        or _PARROT.match(lines[0])
+    ):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def synthesize_answer(question: str, results: list[dict], failures: list[dict]) -> str:
@@ -97,7 +123,7 @@ def synthesize_answer(question: str, results: list[dict], failures: list[dict]) 
             timeout=LLM_TIMEOUT_SECONDS,
         )
         text = resp.choices[0].message.content or ""
-        text = _strip_think(text)
+        text = _sanitize(_strip_think(text))
         if not text:
             raise LlmUnavailable("LLM returned empty answer")
         return text
@@ -118,3 +144,126 @@ def llm_reachable() -> str:
         return "ok"
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
+
+
+# ====================================================================== M2.1
+# LLM call #1: intent parsing (§5.2 responsibility 1, §8.2 call 1).
+# Router policy: LLM first; on failure/low confidence the caller applies
+# keyword rules; if still empty -> needs_clarification (a valid outcome).
+
+INTENT_CONFIDENCE_THRESHOLD = 0.5
+
+INTENT_SYSTEM_PROMPT = """\
+You classify a user's question about satellite-observable ground hazards for \
+a map area they selected. The question may be in ANY language.
+
+Respond with ONLY a JSON object — no prose, no markdown, no code fences:
+{"hazard_types": [...], "confidence": <number 0.0-1.0>}
+
+hazard_types is a subset of exactly these strings:
+- "deformation": ground movement, subsidence, sinking, uplift, landslides, \
+slope instability, cracks appearing in buildings or ground
+- "flood": flooding, inundation, standing water, water extent
+- "vegetation": vegetation loss or change, deforestation, bare soil \
+exposure, crops/greenery disappearing
+
+Include every hazard the question plausibly asks about. A general "is this \
+area dangerous / что тут с грунтом" style question about ground conditions \
+means ["deformation"]. If the question is unrelated to these hazards or too \
+vague to classify, return {"hazard_types": [], "confidence": 0.0}.\
+"""
+
+
+class IntentParseFailed(RuntimeError):
+    """LLM intent parse failed after retry; caller must use rule fallback."""
+
+
+def _extract_json(text: str) -> dict:
+    """Tolerate models wrapping JSON in prose/fences: take the first {...}."""
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        raise ValueError(f"no JSON object in: {text[:120]!r}")
+    return json.loads(m.group(0))
+
+
+def _validate_intent(obj: dict) -> tuple[list[str], float]:
+    allowed = {"deformation", "flood", "vegetation"}
+    hazards = obj.get("hazard_types")
+    conf = obj.get("confidence")
+    if not isinstance(hazards, list) or not all(h in allowed for h in hazards):
+        raise ValueError(f"bad hazard_types: {hazards!r}")
+    if not isinstance(conf, (int, float)) or not (0.0 <= float(conf) <= 1.0):
+        raise ValueError(f"bad confidence: {conf!r}")
+    # dedupe, keep order
+    seen: list[str] = []
+    for h in hazards:
+        if h not in seen:
+            seen.append(h)
+    return seen, float(conf)
+
+
+def parse_intent(question: str) -> tuple[list[str], float]:
+    """Returns (hazard_types, confidence). Raises IntentParseFailed.
+    Temperature 0, JSON-only, schema-validated, one retry (§8.2 call 1)."""
+    from litellm import completion
+
+    last_err: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            resp = completion(
+                model=f"openai/{LLM_MODEL}",
+                api_base=LLM_BASE_URL,
+                api_key=LLM_API_KEY,
+                messages=[
+                    {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.0,
+                max_tokens=200,
+                timeout=min(LLM_TIMEOUT_SECONDS, 30.0),
+            )
+            text = _strip_think(resp.choices[0].message.content or "")
+            return _validate_intent(_extract_json(text))
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise IntentParseFailed(f"{type(last_err).__name__}: {last_err}")
+
+
+# Keyword-rule fallback (§5.2). Substring match, lowercased; covers the
+# target audience's likely languages (en/ru + a few hy stems).
+_RULE_KEYWORDS: dict[str, list[str]] = {
+    "deformation": [
+        "moving", "movement", "subsid", "sink", "landslide", "slope", "crack",
+        "deform", "uplift", "settle",
+        "двиг", "движ", "просед", "оседа", "провал", "оползн", "оползень",
+        "трещин", "грунт", "смещ",
+        "շարժ", "սողանք", "նստվածք", "ճաք",
+    ],
+    "flood": [
+        "flood", "inundat", "standing water", "water extent", "submerg",
+        "наводн", "затопл", "подтопл", "паводок", "разлив",
+        "ջրհեղեղ", "հեղեղ",
+    ],
+    "vegetation": [
+        "vegetation", "deforest", "bare soil", "trees", "forest loss", "ndvi",
+        "greenery", "crop",
+        "растительн", "вырубк", "обезлес", "лес исчез", "оголени", "посев",
+        "բուսական", "անտառ",
+    ],
+}
+
+
+def rule_intent(question: str) -> list[str]:
+    q = question.lower()
+    hits = [h for h, kws in _RULE_KEYWORDS.items() if any(k in q for k in kws)]
+    return hits
+
+
+CLARIFICATION_TEXT = (
+    "I couldn't tell which hazard you're asking about. Please rephrase, "
+    "mentioning one of: ground movement / subsidence / landslides, "
+    "flooding, or vegetation loss.\n\n"
+    "Не удалось понять, о какой опасности вы спрашиваете. Уточните, "
+    "пожалуйста: движение/проседание грунта или оползни, наводнение, "
+    "или потеря растительности."
+)
