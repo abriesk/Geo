@@ -41,7 +41,7 @@ Still ahead (per §11 of the technical reference):
 Dummy wrappers remain for flood (and temporarily for any non-deformation / non-vegetation path).
 
 ## Quick start
-
+```
 bash
 cp .env.example .env
 # Required: POSTGRES_PASSWORD, RABBITMQ_DEFAULT_PASS, LLM_BASE_URL, LLM_MODEL
@@ -67,7 +67,7 @@ curl -s -X POST localhost:8000/query -H 'Content-Type: application/json' -d '{
 curl -s localhost:8000/status/<query_id> | python3 -m json.tool
 # Final answer + artifacts
 curl -s localhost:8000/result/<query_id> | python3 -m json.tool
-
+```
 # UI: http://<host>:8501
 # RabbitMQ management: http://<host>:15672
 
