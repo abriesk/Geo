@@ -107,7 +107,8 @@ def _yyyymmdd(d: str | None, fallback) -> str:
 
 
 def _configure_batch(batch_src: str, batch_dst: str, *, nlook: int,
-                     clip_geo: str, start: str, end: str) -> None:
+                     clip_geo: str, start: str, end: str,
+                     coh_thre: float = 0.3) -> None:
     """Copy batch_LiCSBAS.sh and set the handful of vars we drive."""
     import re as _re
     text = open(batch_src).read()
@@ -120,6 +121,12 @@ def _configure_batch(batch_src: str, batch_dst: str, *, nlook: int,
         r'^p01_start_date=.*$': f'p01_start_date="{start}"',
         r'^p01_end_date=.*$': f'p01_end_date="{end}"',
         r'^p01_get_gacos=.*$': 'p01_get_gacos="n"',
+        # Coherence-mask threshold (step 15). LiCSBAS default 0.05 is very
+        # permissive and leaves decorrelation speckle in the velocity field
+        # (visible on the M3.4a map as a salt-and-pepper edge region). Raising
+        # it drops low-coherence pixels before the stats/PNG. Tunable; eyeball
+        # the map to calibrate per region.
+        r'^p15_coh_thre=.*$': f'p15_coh_thre="{coh_thre}"',
     }
     for pat, repl in subs.items():
         text, n = _re.subn(pat, repl, text, count=1, flags=_re.MULTILINE)
@@ -140,6 +147,11 @@ def _run_batch(workdir: str, emit_line) -> int:
     # ensure the licsbas env bin (this interpreter's dir) leads PATH so the
     # batch's child LiCSBAS*.py use the right python/gdal.
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    # point GDAL/PROJ at the licsbas env's proj database (silences the harmless
+    # "PROJ: Open of .../share/proj failed" warning; geotransform math is
+    # unaffected either way).
+    env.setdefault("PROJ_LIB", os.path.join(
+        os.path.dirname(os.path.dirname(sys.executable)), "share", "proj"))
     proc = subprocess.Popen(
         ["bash", "batch_LiCSBAS.sh"], cwd=workdir,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
@@ -357,9 +369,11 @@ def run_licsbas(args, params: dict) -> int:
 
     progress(3, f"preparing LiCSBAS run for frame {frame} ({start}..{end}, clip {clip_geo})")
     licsbas_home = os.environ.get("LiCSBAS", "/opt/LiCSBAS")
+    coh_thre = float(params.get("coh_thre", 0.3))
     _configure_batch(os.path.join(licsbas_home, "batch_LiCSBAS.sh"),
                      os.path.join(workdir, "batch_LiCSBAS.sh"),
-                     nlook=nlook, clip_geo=clip_geo, start=start, end=end)
+                     nlook=nlook, clip_geo=clip_geo, start=start, end=end,
+                     coh_thre=coh_thre)
 
     progress(5, "starting LiCSBAS pipeline (download + inversion — this is slow)")
     rc = _run_batch(workdir, lambda pct, msg: progress(pct, msg))
