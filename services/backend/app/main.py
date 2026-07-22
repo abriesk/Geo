@@ -294,7 +294,7 @@ app.mount("/files", StaticFiles(directory=RESULTS_ROOT), name="files")
 HAZARD_TO_WRAPPER = {
     "deformation": "wrap_licsbas", # M3.2: real InSAR
     "flood": "wrap_dummy",         # M4: wrap_floodpy
-    "vegetation": "wrap_dummy",    # M2.3: wrap_ndvi
+    "vegetation": "wrap_ndvi",     # M2.3: real NDVI
 }
 DEPTH_MAX_METHODS = {"quick": 1, "standard": 2, "thorough": len(HAZARD_TO_WRAPPER)}
 
