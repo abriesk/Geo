@@ -25,6 +25,19 @@ Newest-at-top within each section. [DONE] items kept briefly for provenance.
   vertical) is better science and helps distinguish real motion from noise.
   Target: M5/M6.
 
+- **Analysed fraction of the AOI is never reported.** (M4.1.3, found on a real
+  La Spezia query) The chosen LiCSAR frame can cover only part of the drawn
+  AOI, and `find_licsar_frames` accepts frames overlapping as little as 5%.
+  Measured case: AOI 9.6597/9.8657/44.1310/44.3278 (~359 km2, independently
+  confirmed by EGMS returning 1470 points at 4.1/km2) was clipped to 207x52 px
+  ~= 95 km2 — **26% of the drawn area, analysed and presented as "the area"**.
+  Fix: report both frame-coverage fraction (clip vs requested) and valid-pixel
+  fraction in the quality block, caveat when low, and raise
+  `min_overlap_fraction` above 5% or caveat low-overlap frames loudly.
+  Deferred with the rest of the wording work: the answer/prompt layer is being
+  reworked for multi-hazard synthesis (M5/M6), so these caveats should be
+  written once, against the finished picture. Target: M5.
+
 ## Frame catalog & coverage
 
 - **Catalog latest-epoch enrichment.** (M3.4a) The catalog stores footprint
@@ -88,6 +101,20 @@ Newest-at-top within each section. [DONE] items kept briefly for provenance.
   backend crash mid-synthesis strands the query. Fix: startup/periodic sweeper
   re-finalizing queries stuck past a timeout. Target: M5.
 
+- **LiCSBAS step-11 "All ifgs are regarded as bad" crashes instead of
+  answering.** (M4.1.3) When the clipped AOI contains no coherent scatterers —
+  water, dense vegetation, steep terrain — `n_unw_valid` is 0, every
+  interferogram fails the coverage test, and LiCSBAS raises. Verified on a La
+  Spezia (harbour + wooded hills) query where EGMS independently found only
+  ~4 points/km2 against a ~100/km2 grid, i.e. ~4% of the area was measurable
+  at all. Cost: ~20 min of download, then three identical retries of a
+  deterministic failure. Fix: catch it, emit an honest "this area has almost no
+  usable radar measurements" result, exit 0 so it is not retried. This is
+  §11.2's documented "AOI over water -> refuse gracefully" edge case.
+  NOTE: unlike the reporting items this is a robustness fix, not a wording one,
+  and does not depend on the prompt rework. Target: M5, or fold into any slice
+  that touches wrapper failure paths.
+
 ## Answer quality (LLM)
 
 - **Post-synthesis numeric/date validator.** (M1.2/M2.3) The sanitizer now
@@ -102,3 +129,15 @@ Newest-at-top within each section. [DONE] items kept briefly for provenance.
 - **Smoke scripts assume cache behaviour they don't set up.** (M2.3) Fix:
   dedicated cache tests pinning explicit dates, asserting on backend cache
   HIT/MISS log lines rather than timing. Target: M5.
+
+## Frontend / UX
+
+- **No map search.** (M4.1.3) The AOI is drawn on a bare map with no place
+  search, so picking a test or real area means eyeballing coordinates — which
+  is how a La Spezia test AOI ended up largely over the harbour. Fix: a
+  geocoder search box (Nominatim or similar) that pans/zooms the map.
+  Target: M5.
+
+- **Date-range explainer.** (M3.4b) Prepared in `docs/m34b_frontend_edit.md`,
+  not yet applied: help text on the "Limit date range" control plus per-hazard
+  window guidance. Target: whenever the frontend is next touched.
