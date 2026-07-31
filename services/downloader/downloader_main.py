@@ -102,7 +102,8 @@ def _pick_scenes(products) -> list:
     return picks
 
 
-def _upsert_cache(task: DownloadTaskMessage, out_dir: Path, scene_paths: list[str]) -> None:
+def _upsert_cache(task: DownloadTaskMessage, out_dir: Path, scene_paths: list[str],
+                  product_type: str = "s2") -> None:
     import psycopg
 
     a_hash = aoi_hash(task.aoi.coordinates[0])
@@ -111,10 +112,10 @@ def _upsert_cache(task: DownloadTaskMessage, out_dir: Path, scene_paths: list[st
         conn.execute(
             """INSERT INTO cached_data
                (aoi_hash, dates_start, dates_end, product_type, file_paths, expiry_ts)
-               VALUES (%s, %s, %s, 's2', %s, now() + %s * interval '1 day')""",
-            (a_hash, task.dates.start, task.dates.end, file_paths, CACHE_EXPIRY_DAYS),
+               VALUES (%s, %s, %s, %s, %s, now() + %s * interval '1 day')""",
+            (a_hash, task.dates.start, task.dates.end, product_type, file_paths, CACHE_EXPIRY_DAYS),
         )
-    log(f"cache upsert: {a_hash[:12]}… s2 {task.dates.start}..{task.dates.end}")
+    log(f"cache upsert: {a_hash[:12]}… {product_type} {task.dates.start}..{task.dates.end}")
 
 
 def run_cdse(task: DownloadTaskMessage, emit) -> str:
@@ -173,7 +174,7 @@ def run_cdse(task: DownloadTaskMessage, emit) -> str:
     scene_paths: list[str] = []
     for i, product in enumerate(picks):
         title = product.properties.get("title", f"scene{i}")
-        emit(20 + i * 35, f"downloading {title[:60]}")
+        _progress(channel, task, 20 + i * 35, f"downloading {title[:60]}")
         backoff = 30
         for attempt_dl in range(4):
             try:
@@ -184,8 +185,8 @@ def run_cdse(task: DownloadTaskMessage, emit) -> str:
                 text = f"{type(e).__name__}: {e}"
                 quota = any(k in text.lower() for k in ("429", "quota", "too many", "throttl"))
                 if quota and attempt_dl < 3:
-                    emit(20 + i * 35,
-                         f"CDSE quota/throttle hit; backing off {backoff}s (§5.3)")
+                    _progress(channel, task, 20 + i * 35,
+                              f"CDSE quota/throttle hit; backing off {backoff}s (§5.3)")
                     time.sleep(backoff)
                     backoff *= 2
                     continue
@@ -208,11 +209,19 @@ def _execute_with_heartbeat(connection, channel, task: DownloadTaskMessage):
 
     def work():
         try:
-            if task.tier.value != "cdse":
+            tier = task.tier.value
+            if tier == "cdse":
+                outcome["result"] = run_cdse(task, lambda p, m: prog_q.put((p, m)))
+            elif tier == "egms":
+                # M4.1: lazy-import so the downloader starts without CLMS deps
+                # until the live path is exercised.
+                from run_egms import run_egms
+                outcome["result"] = run_egms(
+                    task, lambda p, m: prog_q.put((p, m)), _upsert_cache)
+            else:
                 raise RuntimeError(
-                    f"download tier '{task.tier.value}' not implemented until its milestone (§11)"
+                    f"download tier '{tier}' not implemented until its milestone (§11)"
                 )
-            outcome["result"] = run_cdse(task, lambda p, m: prog_q.put((p, m)))
         except BaseException as e:  # noqa: BLE001
             outcome["error"] = e
 

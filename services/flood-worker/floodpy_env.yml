@@ -1,0 +1,92 @@
+# FLOODPY environment — CPU, statistical mode (M4.2a)
+#
+# NOT FLOODPY_gpu_env.yml. That file is a full `conda env export` (every
+# transitive package pinned), pulls cudatoolkit 11.1 + pytorch GPU for the ViT
+# path we do not use, and — see below — pins a numpy that its own code crashes
+# on. This is a hand-built CPU equivalent for the statistical path, with the
+# two ceilings that FLOODPY's source genuinely requires.
+#
+# THE TWO CEILINGS (both read from FLOODPY's code, not guessed):
+#
+#   numpy < 1.24
+#     Floodwater_delineation/Statistical_approach/Thresholding_methods.py
+#     uses `np.float`, removed in numpy 1.24. It is not dead code: it is called
+#     from Adaptive_thresholding.py:184, which Classification.py drives — i.e.
+#     squarely on the statistical path we depend on. FLOODPY's own env pins
+#     numpy 1.24.3 and would raise AttributeError there.
+#
+#   pandas < 2.0
+#     Visualization/plotting.py uses DataFrame.append, removed in pandas 2.0.
+#
+# If either ceiling is lifted later, it must come with a patch to FLOODPY (or
+# an upstream fix), not just a version bump.
+name: floodpy
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy=1.23.*          # ceiling: np.float (see above)
+  - pandas=1.5.*          # ceiling: DataFrame.append (see above)
+  - scipy=1.10.*
+  - scikit-image=0.20.*
+  - scikit-learn
+  - numba=0.57.*          # requires numpy <1.25, consistent with the ceiling
+  - joblib
+
+  # geospatial / raster
+  - gdal
+  - rasterio
+  - rioxarray
+  - xarray=2023.1.*       # contemporary with pandas 1.5
+  - geopandas
+  - shapely
+  - pyproj
+  - fiona
+  - netcdf4
+  - h5py
+  - zarr
+  - dask
+
+  # plotting / io / misc
+  - matplotlib-base
+  - folium
+  - tqdm
+  - requests
+  - pyyaml
+
+  # ERA5 precipitation (drives flood-event detection)
+  - cdsapi
+
+  # Terrain slope masking (DEM_funcs). Imported as `xrspatial`; the conda
+  # package is xarray-spatial. This was missing from the first M4.2a env and
+  # is what broke `import FLOODPYapp` on the box. It drags in datashader and
+  # friends, which is why the env is chunkier than it looks.
+  - xarray-spatial
+
+  # Explicit rather than relying on folium/pandas to pull them transitively —
+  # all three are in FLOODPYapp's real import chain.
+  - branca
+  - xyzservices
+  - python-dateutil
+
+  # Validation-only plotting (Plot_confusion_matrix). Cheap; keeps the whole
+  # package importable.
+  - seaborn
+
+  # FLOODPYapp.py imports the ViT module at import time, which imports BOTH
+  # torch and torchvision. We never run the ViT path — these exist purely so
+  # `import FLOODPYapp` succeeds. If the solver insists on dragging in CUDA
+  # builds, drop both and drive the statistical functions directly instead:
+  # the statistical modules import cleanly without them, which is why the
+  # diagnostic treats FLOODPYapp as optional rather than required.
+  - pytorch-cpu
+  - torchvision
+
+  # NOT included: pygrib. It is used only by Download_GFS_precipitation (GFS
+  # forecasts), which is not our path — we use ERA5 via cdsapi. Adding it
+  # would pull eccodes for no benefit.
+
+  - pip
+  - pip:
+      # precise orbit files for SNAP's Apply-Orbit-File
+      - sentineleof

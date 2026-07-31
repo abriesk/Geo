@@ -2,6 +2,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY libs/contracts /libs/contracts
 COPY libs/licsar /libs/licsar
+COPY libs/egms /libs/egms
 COPY services/backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -e /libs/contracts
 COPY services/backend/app ./app

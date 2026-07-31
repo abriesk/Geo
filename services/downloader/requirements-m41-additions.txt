@@ -1,0 +1,4 @@
+# M4.1 additions to services/downloader/requirements.txt (append these):
+pyjwt>=2.8
+cryptography>=42.0    # pyjwt RS256 backend
+requests>=2.31

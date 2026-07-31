@@ -465,16 +465,6 @@ NEEDS_DOWNLOAD = {
     "wrap_egms": ("egms", "egms", ["EGMS_L2b"], 24),
 }
 
-# Self-downloading wrappers (no NEEDS_DOWNLOAD entry) still need null dates
-# resolved, or they fall back to their own blind default window. §6.1-style
-# per-wrapper lookback in months. MVP: flood screens the recent 3 months for a
-# rainfall event; the frontend date picker + pre-analysis windowing (backlog)
-# will replace this. licsbas listed for parity; its window is otherwise its own.
-SELF_DOWNLOAD_LOOKBACK = {
-    "wrap_floodpy": 3,
-    "wrap_licsbas": 3,
-}
-
 
 def _effective_dates(dates, lookback_months: int):
     """§6.1: null dates -> per-hazard default lookback."""
@@ -549,21 +539,10 @@ def _route_and_enqueue(query_id: uuid.UUID, payload: QueryPayload) -> None:
                     print(f"[router] analysis-task cap {MAX_ANALYSIS_TASKS} reached;"
                           f" skipping {hazard}/{wrapper}", flush=True)
                     continue
-                # Resolve null dates for self-downloading wrappers so they do
-                # not fall back to a blind default window (M4.2c). Download-fed
-                # paths re-resolve with their own lookback below; passing an
-                # already-resolved range through _effective_dates is a no-op.
-                _self_lb = SELF_DOWNLOAD_LOOKBACK.get(wrapper)
-                if _self_lb is not None:
-                    _cs, _ce = _effective_dates(payload.dates, _self_lb)
-                    from geohazard_contracts import DateRange as _DRc
-                    _common_dates = _DRc(start=_cs, end=_ce)
-                else:
-                    _common_dates = payload.dates
                 common = dict(
                     query_id=query_id,
                     aoi=payload.aoi,
-                    dates=_common_dates,
+                    dates=payload.dates,
                 )
                 # Results are per-METHOD (M4.1.1): two deformation methods would
                 # otherwise both write .../deformation/result.json and silently

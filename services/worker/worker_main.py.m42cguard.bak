@@ -179,14 +179,6 @@ def run_wrapper_subprocess(task: AnalysisTaskMessage, emit) -> str:
 
 
 def run_task(task: AnalysisTaskMessage, emit) -> str:
-    if task.name == "wrap_floodpy":
-        # wrap_floodpy belongs on tasks.flood (the flood-worker). If it
-        # reaches the main worker it must NOT be dummied into a fake
-        # 'subsiding' result — that would be a confident lie. Fail so it
-        # dead-letters and the misroute is visible.
-        raise RuntimeError(
-            "wrap_floodpy received on tasks.analysis; it must run on the "
-            "flood-worker via tasks.flood. Refusing to fake a result.")
     if task.name in REAL_WRAPPERS:
         return run_wrapper_subprocess(task, emit)
     return run_dummy(task, emit)

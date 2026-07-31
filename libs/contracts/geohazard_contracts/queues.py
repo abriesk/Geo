@@ -1,7 +1,8 @@
 """RabbitMQ topology (§5.6, amended M2.2).
 
-Kind-split task queues: `tasks.analysis` (worker) and `tasks.download`
-(downloader), both durable, manual ack, dead-lettering to `tasks.dlq`.
+Kind-split task queues: `tasks.analysis` (worker), `tasks.download`
+(downloader), and `tasks.flood` (flood-worker; added M4.2c), all durable,
+manual ack, dead-lettering to `tasks.dlq`.
 `progress` and `results` unchanged. Message contracts (§6.4) unchanged.
 
 Every service declares this topology idempotently at startup.
@@ -13,12 +14,13 @@ from __future__ import annotations
 
 ANALYSIS_QUEUE = "tasks.analysis"
 DOWNLOAD_QUEUE = "tasks.download"
+FLOOD_QUEUE = "tasks.flood"    # M4.2c: separate flood-worker (SNAP+FLOODPY)
 PROGRESS_QUEUE = "progress"
 RESULTS_QUEUE = "results"
 TASKS_DLQ = "tasks.dlq"
 
 MAX_TASK_RETRIES = 3  # §5.6 / §7 error path
-PREFETCH_COUNT = 1    # §5.6, worker & downloader consumers
+PREFETCH_COUNT = 1    # §5.6, worker / downloader / flood-worker consumers
 
 _DLQ_ARGS = {"x-dead-letter-exchange": "", "x-dead-letter-routing-key": TASKS_DLQ}
 
@@ -28,6 +30,7 @@ def declare_topology(channel) -> None:
     channel.queue_declare(queue=TASKS_DLQ, durable=True)
     channel.queue_declare(queue=ANALYSIS_QUEUE, durable=True, arguments=dict(_DLQ_ARGS))
     channel.queue_declare(queue=DOWNLOAD_QUEUE, durable=True, arguments=dict(_DLQ_ARGS))
+    channel.queue_declare(queue=FLOOD_QUEUE, durable=True, arguments=dict(_DLQ_ARGS))
     channel.queue_declare(queue=PROGRESS_QUEUE, durable=True)
     channel.queue_declare(queue=RESULTS_QUEUE, durable=True)
 

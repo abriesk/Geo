@@ -284,79 +284,6 @@ def _render_velocity_png(vel, valid, path, title):
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
-def _frame_bbox_from_catalog(frame_id: str, catalog_path: str):
-    """(min_lon, min_lat, max_lon, max_lat) for a frame, or None if unknown."""
-    try:
-        with open(catalog_path) as fh:
-            data = json.load(fh)
-    except Exception:  # noqa: BLE001
-        return None
-    for feat in data.get("features", []):
-        if (feat.get("properties") or {}).get("frame_id") != frame_id:
-            continue
-        try:
-            ring = feat["geometry"]["coordinates"][0]
-        except Exception:  # noqa: BLE001
-            return None
-        lons = [c[0] for c in ring]
-        lats = [c[1] for c in ring]
-        return (min(lons), min(lats), max(lons), max(lats))
-    return None
-
-
-def _frame_covers_aoi(frame_id: str, aoi_bbox, catalog_path: str) -> bool:
-    """Does the frame footprint overlap the AOI? aoi_bbox is (lon1, lon2, lat1,
-    lat2) as returned by _aoi_bbox.
-
-    Defence in depth (M4.1.2): the router already validates, but a frame id can
-    also arrive from --frame or a stale params blob. Clipping an AOI out of a
-    frame on another continent yields negative raster dimensions at best, and a
-    plausible map of the wrong place at worst. If the frame is absent from the
-    catalog we return True — the router is the authority, and a missing catalog
-    must not block a legitimate run.
-    """
-    fb = _frame_bbox_from_catalog(frame_id, catalog_path)
-    if fb is None:
-        return True
-    lon1, lon2, lat1, lat2 = aoi_bbox
-    return not (lon2 < fb[0] or lon1 > fb[2] or lat2 < fb[1] or lat1 > fb[3])
-
-
-def _no_coverage_result(args, start: str, end: str, reason: str) -> int:
-    """Honest 'no InSAR coverage' result. Exit 0 so a deterministic geographic
-    miss is not retried three times."""
-    sys.path.insert(0, "/libs/contracts")
-    from geohazard_contracts import ResultJson
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    result = ResultJson.model_validate({
-        "query_id": args.query_id,
-        "method": "licsbas",
-        "status": "failed",
-        "summary_stats": {},
-        "quality": {
-            "scene_count": 0,
-            "date_coverage": [_iso_date(start), _iso_date(end)],
-            "coherence_mean": None, "masked_fraction": None,
-            "cloud_fraction": None, "confidence": "low",
-            "caveats": [
-                reason,
-                "The LiCSAR archive processes Sentinel-1 data over selected "
-                "regions — mainly tectonically and volcanically active areas — "
-                "rather than the whole world, so many places have no frame.",
-            ],
-        },
-        "artifacts": [],
-        "attribution": [
-            "LiCSAR contains modified Copernicus Sentinel data analysed by COMET.",
-        ],
-    })
-    with open(os.path.join(args.output_dir, "result.json"), "w") as f:
-        f.write(result.model_dump_json(indent=2))
-    progress(100, "no InSAR coverage for this area")
-    return 0
-
-
 def run_licsbas(args, params: dict) -> int:
     """Drive batch_LiCSBAS.sh end to end, then parse -> result.json (§6.3)."""
     from datetime import date as _date
@@ -384,30 +311,9 @@ def run_licsbas(args, params: dict) -> int:
     candidates = params.get("candidate_frames") or (
         [args.frame or params.get("frame_id")] if (args.frame or params.get("frame_id")) else [])
     candidates = [c for c in candidates if c]
-
-    # M4.1.2: the router found no frame covering this AOI -> answer immediately.
-    if params.get("no_insar_coverage"):
-        return _no_coverage_result(
-            args, start, end,
-            "No InSAR frame in the LiCSAR archive covers this area, so a "
-            "radar time-series could not be computed for it.")
-
-    # M4.1.2: independently drop candidates whose footprint misses the AOI.
-    catalog_path = params.get("licsar_catalog", "/data/licsar_frames.geojson")
-    aoi_bbox = (lon1, lon2, lat1, lat2)
-    covering = [c for c in candidates
-                if _frame_covers_aoi(c, aoi_bbox, catalog_path)]
-    if len(covering) != len(candidates):
-        dropped = [c for c in candidates if c not in covering]
-        print(f"[wrap_licsbas] dropping frame(s) that do not cover the AOI: "
-              f"{dropped}", flush=True)
-    candidates = covering
-
     if not candidates:
-        return _no_coverage_result(
-            args, start, end,
-            "No InSAR frame covering this area was available, so a radar "
-            "time-series could not be computed for it.")
+        print("ERROR no candidate frames provided", file=sys.stderr)
+        return 2
 
     frame = None
     probed = []
