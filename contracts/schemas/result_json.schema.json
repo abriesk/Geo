@@ -46,6 +46,15 @@
       "title": "Method",
       "type": "string"
     },
+    "NoDataReason": {
+      "description": "M5.1: distinguishes the two meanings of NO_DATA (\u00a76.3). Required iff\nstatus == no_data, null otherwise (enforced on ResultJson).",
+      "enum": [
+        "measured_absence",
+        "no_coverage"
+      ],
+      "title": "NoDataReason",
+      "type": "string"
+    },
     "QualityBlock": {
       "additionalProperties": false,
       "description": "Feeds the LLM's confidence language (\u00a75.4, \u00a78.3).",
@@ -131,6 +140,7 @@
       "enum": [
         "ok",
         "partial",
+        "no_data",
         "failed"
       ],
       "title": "ResultStatus",
@@ -156,6 +166,17 @@
     },
     "method": {
       "$ref": "#/$defs/Method"
+    },
+    "no_data_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NoDataReason"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "quality": {
       "$ref": "#/$defs/QualityBlock"

@@ -42,7 +42,6 @@ from geohazard_contracts import (
 from geohazard_contracts.queues import (
     ANALYSIS_QUEUE,
     DOWNLOAD_QUEUE,
-    FLOOD_QUEUE,
     PROGRESS_QUEUE,
     RESULTS_QUEUE,
     connect_and_declare,
@@ -130,23 +129,6 @@ def _finalize_query_if_done(query_id: str) -> None:
         else:
             failures.append({"name": t["name"], "error": t["error"]})
 
-    # M5.1 (§6.3 finalize rule): partition results by scientific status. A
-    # NO_DATA result is a legitimate answer (the wrapper exited 0), not a
-    # failure. measured_absence = "observed, nothing there" (a real answer);
-    # no_coverage = "could not observe here" (a data-availability gap). Both
-    # still count as the query having produced an answer; the distinction
-    # drives answer wording and multi-method synthesis, not query success.
-    measured = [r for r in results if r.get("status") in ("ok", "partial")]
-    absence = [r for r in results
-               if r.get("status") == "no_data"
-               and r.get("no_data_reason") == "measured_absence"]
-    no_cov = [r for r in results
-              if r.get("status") == "no_data"
-              and r.get("no_data_reason") == "no_coverage"]
-    print(f"[backend] query {query_id} finalize partition: "
-          f"measured={len(measured)} measured_absence={len(absence)} "
-          f"no_coverage={len(no_cov)} failed={len(failures)}", flush=True)
-
     try:
         answer = llm.synthesize_answer(q["question"], results, failures)
         print(f"[backend] query {query_id}: LLM synthesis ok", flush=True)
@@ -157,9 +139,6 @@ def _finalize_query_if_done(query_id: str) -> None:
             + _template_answer(q["question"], results, failures)
         )
 
-    # DONE whenever at least one method produced a result of ANY status
-    # (ok/partial/no_data) — a no-data answer is still an answer. FAILED only
-    # when every task errored out and there is nothing legitimate to report.
     final = QueryStatus.DONE if results else QueryStatus.FAILED
     with _db() as conn:
         conn.execute(
@@ -258,25 +237,21 @@ def _publish_pending_analyses(query_id: str, input_dir: str) -> None:
         return
 
     aoi_raw = q["aoi"] if not isinstance(q["aoi"], str) else json.loads(q["aoi"])
+    hazard = "vegetation"  # M2.2: sole download-gated hazard; M3 generalizes
     import pika
 
     conn_mq, channel = connect_and_declare(AMQP_URL)
     for row in pending:
-        # M4.1.1: derive the hazard from the wrapper. This was hardcoded to
-        # "vegetation" back when vegetation was the only download-gated hazard,
-        # which filed EGMS deformation results under .../vegetation/.
-        hazard = WRAPPER_TO_HAZARD.get(row["name"], "vegetation")
         msg = AnalysisTaskMessage(
             task_id=row["task_id"], query_id=uuid.UUID(query_id),
             name=row["name"], input_dir=input_dir,
-            output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}/{row['name']}",
+            output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
             aoi=_Aoi.model_validate(aoi_raw),
             dates=_DR(start=q["dates_start"], end=q["dates_end"]),
             params={"hazard": hazard,
-                    "simulate_failure": "FAIL!" in (q["question"] or ""),
-                    "simulate_permanent_failure": "PERMFAIL!" in (q["question"] or "")},
+                    "simulate_failure": "FAIL!" in (q["question"] or "")},
         )
-        channel.basic_publish(exchange="", routing_key=_analysis_route(msg.name),
+        channel.basic_publish(exchange="", routing_key=ANALYSIS_QUEUE,
                               body=msg.model_dump_json(),
                               properties=pika.BasicProperties(delivery_mode=2))
     conn_mq.close()
@@ -316,39 +291,12 @@ app.mount("/files", StaticFiles(directory=RESULTS_ROOT), name="files")
 # §5.2 responsibilities 1-2 (partial): intent parse (LLM, rule fallback,
 # clarification) + depth fan-out. All hazards still run the dummy wrapper;
 # M2.3/M3/M4 swap in real wrapper names per hazard.
-
-def _analysis_route(name: str) -> str:
-    # M4.2c: wrap_floodpy runs in the separate flood-worker via its own
-    # queue; every other wrapper stays on tasks.analysis. Only the
-    # routing key changes — the AnalysisTaskMessage contract is unchanged.
-    from geohazard_contracts.queues import ANALYSIS_QUEUE, FLOOD_QUEUE
-    return FLOOD_QUEUE if name == "wrap_floodpy" else ANALYSIS_QUEUE
-
 HAZARD_TO_WRAPPER = {
     "deformation": "wrap_licsbas", # M3.2: real InSAR
-    "flood": "wrap_floodpy",       # M4.2c: real flood via flood-worker
+    "flood": "wrap_dummy",         # M4: wrap_floodpy
     "vegetation": "wrap_ndvi",    # M2.3: wrap_ndvi
 }
 DEPTH_MAX_METHODS = {"quick": 1, "standard": 2, "thorough": len(HAZARD_TO_WRAPPER)}
-
-# M4.1.1: reverse lookup, used by the download->analysis handoff and by the
-# per-method results layout. It cannot be derived by inverting
-# HAZARD_TO_WRAPPER, because deformation maps to TWO wrappers depending on
-# which tier(s) the ladder selects.
-WRAPPER_TO_HAZARD = {
-    "wrap_licsbas": "deformation",
-    "wrap_egms": "deformation",
-    "wrap_ndvi": "vegetation",
-    "wrap_floodpy": "flood",
-    "wrap_dummy": "vegetation",
-}
-# Ceiling on analysis tasks per query, so "thorough" on a multi-hazard question
-# cannot fan out into a pile of half-hour LiCSBAS runs.
-MAX_ANALYSIS_TASKS = int(os.environ.get("MAX_ANALYSIS_TASKS", "4"))
-# Lowest depth at which deformation runs EGMS *and* LiCSBAS together.
-# Set to "thorough" to keep standard-depth European queries fast.
-DEFORM_DUAL_METHOD_MIN_DEPTH = os.environ.get(
-    "DEFORM_DUAL_METHOD_MIN_DEPTH", "standard")
 
 
 # M3.2: InSAR frame configuration. wrap_licsbas is self-downloading (no
@@ -381,102 +329,39 @@ def _resolve_deform_frames(aoi_geojson: dict) -> list[str]:
     except Exception as e:  # noqa: BLE001
         print(f"[router] frame resolution error ({e!r}); using fallback", flush=True)
     if DEFAULT_DEFORM_FRAME:
-        # M4.1.2: the fallback is ONE fixed frame (originally a test frame).
-        # Using it for an AOI it does not cover would analyse the WRONG PLACE
-        # and report the result under the user's query. Only use it when the
-        # catalog confirms it actually overlaps this AOI.
-        if _frame_covers_aoi(DEFAULT_DEFORM_FRAME, aoi_geojson):
-            print(f"[router] fallback frame {DEFAULT_DEFORM_FRAME}", flush=True)
-            return [DEFAULT_DEFORM_FRAME]
-        print(f"[router] fallback frame {DEFAULT_DEFORM_FRAME} does not cover "
-              "this AOI -> no InSAR coverage here", flush=True)
+        print(f"[router] fallback frame {DEFAULT_DEFORM_FRAME}", flush=True)
+        return [DEFAULT_DEFORM_FRAME]
     return []
 
 
-def _frame_covers_aoi(frame_id: str, aoi_geojson: dict) -> bool:
-    """Does this frame's catalog footprint overlap the AOI at all? (M4.1.2)
-
-    Deliberately fails CLOSED: if the catalog is missing or the frame is not in
-    it, we cannot prove coverage, so we answer False. Analysing the wrong place
-    is far worse than declining to analyse.
-    """
-    try:
-        with open(LICSAR_CATALOG) as fh:
-            data = json.load(fh)
-        ring = aoi_geojson["coordinates"][0]
-        a_lons = [c[0] for c in ring]
-        a_lats = [c[1] for c in ring]
-        for feat in data.get("features", []):
-            if (feat.get("properties") or {}).get("frame_id") != frame_id:
-                continue
-            f_ring = feat["geometry"]["coordinates"][0]
-            f_lons = [c[0] for c in f_ring]
-            f_lats = [c[1] for c in f_ring]
-            return not (max(a_lons) < min(f_lons) or min(a_lons) > max(f_lons)
-                        or max(a_lats) < min(f_lats) or min(a_lats) > max(f_lats))
-        print(f"[router] frame {frame_id} not found in catalog", flush=True)
-    except Exception as e:  # noqa: BLE001
-        print(f"[router] cannot verify frame coverage ({e!r})", flush=True)
-    return False
-
-
 def _deform_params(question: str, aoi_geojson: dict) -> dict:
-    p = {"hazard": "deformation", "simulate_failure": "FAIL!" in question,
-         "simulate_permanent_failure": "PERMFAIL!" in question}
+    p = {"hazard": "deformation", "simulate_failure": "FAIL!" in question}
     frames = _resolve_deform_frames(aoi_geojson)
     if frames:
         # MVP: run the best (first) frame — ascending, largest overlap. Running
         # asc+desc as two tasks is a straightforward extension (BACKLOG).
         p["frame_id"] = frames[0]
         p["candidate_frames"] = frames
-    else:
-        # M4.1.2: no frame covers this AOI. Tell the wrapper so it can answer
-        # "no InSAR coverage here" immediately instead of downloading a frame
-        # from somewhere else and failing three times over.
-        p["no_insar_coverage"] = True
     return p
 
 
-def _egms_covers(aoi_geojson: dict) -> bool:
-    """Is the AOI inside the EGMS footprint? Any failure -> False (use LiCSBAS,
-    which is the path that always works)."""
-    if not EGMS_ENABLED:
-        return False
-    try:
-        import sys as _sys
-        if "/libs" not in _sys.path:
-            _sys.path.insert(0, "/libs")
-        from egms.footprint import aoi_in_egms
-        return bool(aoi_in_egms(aoi_geojson, EGMS_FOOTPRINT))
-    except Exception as e:  # noqa: BLE001
-        print(f"[router] EGMS coverage check error ({e!r}); using LiCSBAS", flush=True)
-        return False
-
-
-def _resolve_deform_methods(aoi_geojson: dict, depth: str) -> list[str]:
-    """§3 ladder for deformation, now returning ONE OR MORE methods (M4.1.1).
-
-    EGMS and LiCSBAS are complementary rather than redundant. EGMS is a
-    GNSS-referenced multi-year VERTICAL average over a fixed release window;
-    LiCSBAS is a line-of-sight time series over the window the user asked for,
-    referenced to a locally chosen pixel. Running both lets the answer say
-    things neither can alone — most valuably "stable for years, but moving
-    recently", which is precisely the case worth a professional's attention.
-
-    Depth decides how much work to do. Outside the EGMS footprint only LiCSBAS
-    exists, so depth changes nothing there.
-    """
-    if not _egms_covers(aoi_geojson):
-        print("[router] deformation: LiCSBAS only (AOI outside EGMS footprint)",
-              flush=True)
-        return ["wrap_licsbas"]
-
-    rank = {"quick": 0, "standard": 1, "thorough": 2}
-    if rank.get(depth, 1) >= rank.get(DEFORM_DUAL_METHOD_MIN_DEPTH, 1):
-        print("[router] deformation: EGMS + LiCSBAS (cross-validation)", flush=True)
-        return ["wrap_egms", "wrap_licsbas"]
-    print("[router] deformation tier 1: EGMS (AOI within footprint)", flush=True)
-    return ["wrap_egms"]
+def _resolve_deform_tier(aoi_geojson: dict) -> str:
+    """§3 ladder for deformation: tier-1 EGMS if the AOI is within the EGMS
+    footprint, else tier-2 LiCSBAS. Any failure falls back to LiCSBAS (the
+    working path). Tiers 3/4 (HyP3/raw) are M6."""
+    if EGMS_ENABLED:
+        try:
+            import sys as _sys
+            if "/libs" not in _sys.path:
+                _sys.path.insert(0, "/libs")
+            from egms.footprint import aoi_in_egms
+            if aoi_in_egms(aoi_geojson, EGMS_FOOTPRINT):
+                print("[router] deformation tier 1: EGMS (AOI within footprint)", flush=True)
+                return "wrap_egms"
+        except Exception as e:  # noqa: BLE001
+            print(f"[router] EGMS coverage check error ({e!r}); using LiCSBAS", flush=True)
+    print("[router] deformation tier 2: LiCSBAS", flush=True)
+    return "wrap_licsbas"
 
 
 NEEDS_DOWNLOAD = {
@@ -485,16 +370,6 @@ NEEDS_DOWNLOAD = {
     # M4.1: EGMS keyed by WRAPPER name (deformation's wrapper is tier-dependent,
     # unlike vegetation which is keyed by hazard). Resolved via dl_key below.
     "wrap_egms": ("egms", "egms", ["EGMS_L2b"], 24),
-}
-
-# Self-downloading wrappers (no NEEDS_DOWNLOAD entry) still need null dates
-# resolved, or they fall back to their own blind default window. §6.1-style
-# per-wrapper lookback in months. MVP: flood screens the recent 3 months for a
-# rainfall event; the frontend date picker + pre-analysis windowing (backlog)
-# will replace this. licsbas listed for parity; its window is otherwise its own.
-SELF_DOWNLOAD_LOOKBACK = {
-    "wrap_floodpy": 3,
-    "wrap_licsbas": 3,
 }
 
 
@@ -558,85 +433,60 @@ def _route_and_enqueue(query_id: uuid.UUID, payload: QueryPayload) -> None:
 
         analysis_msgs, download_msgs, deferred_rows = [], [], []
         for hazard in hazards:
-            # M4.1.1: deformation can fan out to SEVERAL methods (EGMS +
-            # LiCSBAS) for cross-validation; every other hazard has one.
+            # M4.1: deformation's wrapper is chosen at routing time by the §3
+            # ladder (EGMS tier-1 in Europe, else LiCSBAS tier-2).
             if hazard == "deformation":
-                wrappers = _resolve_deform_methods(
-                    payload.aoi.model_dump(), payload.depth.value)
+                wrapper = _resolve_deform_tier(payload.aoi.model_dump())
             else:
-                wrappers = [HAZARD_TO_WRAPPER[hazard]]
-
-            for wrapper in wrappers:
-                if len(analysis_msgs) + len(deferred_rows) >= MAX_ANALYSIS_TASKS:
-                    print(f"[router] analysis-task cap {MAX_ANALYSIS_TASKS} reached;"
-                          f" skipping {hazard}/{wrapper}", flush=True)
-                    continue
-                # Resolve null dates for self-downloading wrappers so they do
-                # not fall back to a blind default window (M4.2c). Download-fed
-                # paths re-resolve with their own lookback below; passing an
-                # already-resolved range through _effective_dates is a no-op.
-                _self_lb = SELF_DOWNLOAD_LOOKBACK.get(wrapper)
-                if _self_lb is not None:
-                    _cs, _ce = _effective_dates(payload.dates, _self_lb)
-                    from geohazard_contracts import DateRange as _DRc
-                    _common_dates = _DRc(start=_cs, end=_ce)
-                else:
-                    _common_dates = payload.dates
-                common = dict(
-                    query_id=query_id,
-                    aoi=payload.aoi,
-                    dates=_common_dates,
-                )
-                # Results are per-METHOD (M4.1.1): two deformation methods would
-                # otherwise both write .../deformation/result.json and silently
-                # clobber one another.
-                out_dir = f"{RESULTS_ROOT}/{query_id}/{hazard}/{wrapper}"
-                # A path is download-fed if the hazard OR the resolved wrapper
-                # has a NEEDS_DOWNLOAD entry (vegetation keyed by hazard;
-                # wrap_egms by wrapper). wrap_licsbas has neither -> it
-                # self-downloads.
-                dl_key = hazard if hazard in NEEDS_DOWNLOAD else (
-                    wrapper if wrapper in NEEDS_DOWNLOAD else None)
-                if dl_key is not None:
-                    product_type, tier, products, lookback = NEEDS_DOWNLOAD[dl_key]
-                    eff_start, eff_end = _effective_dates(payload.dates, lookback)
-                    a_hash = payload.aoi.hash()
-                    cached = _cache_lookup(a_hash, product_type, eff_start, eff_end)
-                    if cached:
-                        print(f"[router] cache HIT {product_type} for {a_hash[:12]}… -> skip download", flush=True)
-                        analysis_msgs.append(AnalysisTaskMessage(
-                            task_id=uuid.uuid4(), name=wrapper,
-                            input_dir=cached, output_dir=out_dir,
-                            params={"hazard": hazard,
-                                    "simulate_failure": "FAIL!" in payload.question,
-                                    "simulate_permanent_failure": "PERMFAIL!" in payload.question},
-                            **common,
-                        ))
-                    else:
-                        print(f"[router] cache MISS {product_type} for {a_hash[:12]}… -> download via {tier}", flush=True)
-                        from geohazard_contracts import DateRange as _DR
-                        download_msgs.append(DownloadTaskMessage(
-                            task_id=uuid.uuid4(), tier=tier, products=products,
-                            query_id=query_id, aoi=payload.aoi,
-                            dates=_DR(start=eff_start, end=eff_end),
-                        ))
-                        # The analysis row exists now; its message is built and
-                        # published only once the download completes.
-                        deferred_rows.append((uuid.uuid4(), wrapper))
-                else:
-                    params = ({"hazard": hazard,
-                               "simulate_failure": "FAIL!" in payload.question,
-                               "simulate_permanent_failure": "PERMFAIL!" in payload.question}
-                              if hazard != "deformation"
-                              else _deform_params(payload.question,
-                                                  payload.aoi.model_dump()))
+                wrapper = HAZARD_TO_WRAPPER[hazard]
+            common = dict(
+                query_id=query_id,
+                aoi=payload.aoi,
+                dates=payload.dates,
+            )
+            # A path is download-fed if the hazard OR the resolved wrapper has a
+            # NEEDS_DOWNLOAD entry (vegetation keyed by hazard; wrap_egms by
+            # wrapper). wrap_licsbas has neither -> self-downloading.
+            dl_key = hazard if hazard in NEEDS_DOWNLOAD else (
+                wrapper if wrapper in NEEDS_DOWNLOAD else None)
+            if dl_key is not None:
+                product_type, tier, products, lookback = NEEDS_DOWNLOAD[dl_key]
+                eff_start, eff_end = _effective_dates(payload.dates, lookback)
+                a_hash = payload.aoi.hash()
+                cached = _cache_lookup(a_hash, product_type, eff_start, eff_end)
+                if cached:
+                    print(f"[router] cache HIT {product_type} for {a_hash[:12]}… -> skip download", flush=True)
                     analysis_msgs.append(AnalysisTaskMessage(
                         task_id=uuid.uuid4(), name=wrapper,
-                        input_dir="/data/scratch",
-                        output_dir=out_dir,
-                        params=params,
+                        input_dir=cached, output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
+                        params={"hazard": hazard,
+                                "simulate_failure": "FAIL!" in payload.question},
                         **common,
                     ))
+                else:
+                    print(f"[router] cache MISS {product_type} for {a_hash[:12]}… -> download via {tier}", flush=True)
+                    from geohazard_contracts import DateRange as _DR
+                    download_msgs.append(DownloadTaskMessage(
+                        task_id=uuid.uuid4(), tier=tier, products=products,
+                        query_id=query_id, aoi=payload.aoi,
+                        dates=_DR(start=eff_start, end=eff_end),
+                    ))
+                    # Analysis row exists now but its message is built & published
+                    # only when the download completes (M2.2: vegetation only;
+                    # M3 generalizes this linkage).
+                    deferred_rows.append((uuid.uuid4(), wrapper))
+            else:
+                params = ({"hazard": hazard,
+                           "simulate_failure": "FAIL!" in payload.question}
+                          if hazard != "deformation"
+                          else _deform_params(payload.question, payload.aoi.model_dump()))
+                analysis_msgs.append(AnalysisTaskMessage(
+                    task_id=uuid.uuid4(), name=wrapper,
+                    input_dir="/data/scratch",
+                    output_dir=f"{RESULTS_ROOT}/{query_id}/{hazard}",
+                    params=params,
+                    **common,
+                ))
 
         with _db() as conn:
             for t in analysis_msgs:
@@ -662,7 +512,7 @@ def _route_and_enqueue(query_id: uuid.UUID, payload: QueryPayload) -> None:
 
         conn_mq, channel = connect_and_declare(AMQP_URL)
         for t in analysis_msgs:
-            channel.basic_publish(exchange="", routing_key=_analysis_route(t.name),
+            channel.basic_publish(exchange="", routing_key=ANALYSIS_QUEUE,
                                   body=t.model_dump_json(),
                                   properties=pika.BasicProperties(delivery_mode=2))
         for d in download_msgs:

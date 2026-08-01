@@ -52,7 +52,23 @@ class Method(str, Enum):
 class ResultStatus(str, Enum):
     OK = "ok"
     PARTIAL = "partial"
+    # M5.1: a definite terminal outcome with no measurements that is NOT an
+    # error — the wrapper exits 0 and this is a legitimate answer, never
+    # retried. See §6.3. Ordered before FAILED as a usability gradient.
+    NO_DATA = "no_data"
     FAILED = "failed"
+
+
+class NoDataReason(str, Enum):
+    """M5.1: distinguishes the two meanings of NO_DATA (§6.3). Required iff
+    status == no_data, null otherwise (enforced on ResultJson)."""
+    # The method observed the AOI and there is genuinely nothing to report
+    # (deformation over water/dense veg with no coherent scatterers after
+    # inversion; a flood search that found no event/anomaly). A real answer.
+    MEASURED_ABSENCE = "measured_absence"
+    # The method could not observe the AOI in the window (no covering frame,
+    # no IFGs in range, no low-cloud scenes, no acquisitions). A coverage gap.
+    NO_COVERAGE = "no_coverage"
 
 
 class DownloadTier(str, Enum):

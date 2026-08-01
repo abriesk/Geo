@@ -141,12 +141,8 @@ _STEP_PCT = {"01": 10, "02": 35, "03": 40, "04": 45, "05": 50,
 _STEP_RE = re.compile(r"LiCSBAS(\d{2})\w*\.py")
 
 
-def _run_batch(workdir: str, emit_line) -> tuple:
-    """Run batch_LiCSBAS.sh in workdir, relaying step progress.
-    Returns (rc, incoherent) where incoherent is True if LiCSBAS aborted
-    because every interferogram failed coherence checks (step 11 "All ifgs
-    are regarded as bad" / low-coherence terrain) — a measured absence, not a
-    processing error. M5.1."""
+def _run_batch(workdir: str, emit_line) -> int:
+    """Run batch_LiCSBAS.sh in workdir, relaying step progress. Returns rc."""
     env = dict(os.environ)
     # ensure the licsbas env bin (this interpreter's dir) leads PATH so the
     # batch's child LiCSBAS*.py use the right python/gdal.
@@ -160,21 +156,15 @@ def _run_batch(workdir: str, emit_line) -> tuple:
         ["bash", "batch_LiCSBAS.sh"], cwd=workdir,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
-    incoherent = False
     for line in proc.stdout:
         line = line.rstrip()
         m = _STEP_RE.search(line)
         if m and m.group(1) in _STEP_PCT:
             emit_line(_STEP_PCT[m.group(1)], f"LiCSBAS step {m.group(1)}")
-        # M5.1: step-11 signature for a fully-incoherent AOI (all IFGs bad).
-        # LiCSBAS raises this before inversion when no interferogram survives
-        # the coherence threshold — i.e. water / dense veg / steep terrain.
-        if "All ifgs are regarded as bad" in line:
-            incoherent = True
         if line:
             print(f"[licsbas] {line[:200]}", flush=True)
     proc.wait()
-    return proc.returncode, incoherent
+    return proc.returncode
 
 
 def _iso_date(yyyymmdd) -> str:
@@ -219,11 +209,7 @@ def _read_results(workdir: str) -> dict:
     n_total = int(vel.size)
     n_valid = int(valid.sum())
     if n_valid == 0:
-        # M5.1: measured absence, not a failure. LiCSBAS ran to completion but
-        # the AOI has no coherent scatterers after inversion. Caught in
-        # run_licsbas -> NO_DATA(measured_absence), exit 0 (no 3x retry).
-        raise NoValidPixels(
-            "no valid (unmasked, coherent) pixels in AOI after inversion")
+        raise RuntimeError("no valid (unmasked, coherent) pixels in AOI after inversion")
 
     vv = vel[valid]
     coh_mean = float(np.nanmean(coh[valid])) if coh is not None else None
@@ -298,101 +284,6 @@ def _render_velocity_png(vel, valid, path, title):
     fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
-def _frame_bbox_from_catalog(frame_id: str, catalog_path: str):
-    """(min_lon, min_lat, max_lon, max_lat) for a frame, or None if unknown."""
-    try:
-        with open(catalog_path) as fh:
-            data = json.load(fh)
-    except Exception:  # noqa: BLE001
-        return None
-    for feat in data.get("features", []):
-        if (feat.get("properties") or {}).get("frame_id") != frame_id:
-            continue
-        try:
-            ring = feat["geometry"]["coordinates"][0]
-        except Exception:  # noqa: BLE001
-            return None
-        lons = [c[0] for c in ring]
-        lats = [c[1] for c in ring]
-        return (min(lons), min(lats), max(lons), max(lats))
-    return None
-
-
-def _frame_covers_aoi(frame_id: str, aoi_bbox, catalog_path: str) -> bool:
-    """Does the frame footprint overlap the AOI? aoi_bbox is (lon1, lon2, lat1,
-    lat2) as returned by _aoi_bbox.
-
-    Defence in depth (M4.1.2): the router already validates, but a frame id can
-    also arrive from --frame or a stale params blob. Clipping an AOI out of a
-    frame on another continent yields negative raster dimensions at best, and a
-    plausible map of the wrong place at worst. If the frame is absent from the
-    catalog we return True — the router is the authority, and a missing catalog
-    must not block a legitimate run.
-    """
-    fb = _frame_bbox_from_catalog(frame_id, catalog_path)
-    if fb is None:
-        return True
-    lon1, lon2, lat1, lat2 = aoi_bbox
-    return not (lon2 < fb[0] or lon1 > fb[2] or lat2 < fb[1] or lat1 > fb[3])
-
-
-class NoValidPixels(Exception):
-    """M5.1: LiCSBAS finished but the AOI has no coherent scatterers after
-    inversion (water, dense vegetation, steep terrain). A measured absence,
-    not a failure — caught in run_licsbas and turned into a NO_DATA result."""
-
-
-def _no_data_result(
-    args, start: str, end: str, *, reason_flag: str, caveats: list, progress_msg: str
-) -> int:
-    """M5.1: shared honest NO_DATA result builder (§6.3). status=no_data +
-    no_data_reason; exit 0 so a deterministic no-data outcome is not retried.
-    reason_flag is 'no_coverage' (could not observe) or 'measured_absence'
-    (observed, nothing there)."""
-    sys.path.insert(0, "/libs/contracts")
-    from geohazard_contracts import ResultJson
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    result = ResultJson.model_validate({
-        "query_id": args.query_id,
-        "method": "licsbas",
-        "status": "no_data",
-        "no_data_reason": reason_flag,
-        "summary_stats": {},
-        "quality": {
-            "scene_count": 0,
-            "date_coverage": [_iso_date(start), _iso_date(end)],
-            "coherence_mean": None, "masked_fraction": None,
-            "cloud_fraction": None, "confidence": "low",
-            "caveats": caveats,
-        },
-        "artifacts": [],
-        "attribution": [
-            "LiCSAR contains modified Copernicus Sentinel data analysed by COMET.",
-        ],
-    })
-    with open(os.path.join(args.output_dir, "result.json"), "w") as f:
-        f.write(result.model_dump_json(indent=2))
-    progress(100, progress_msg)
-    return 0
-
-
-def _no_coverage_result(args, start: str, end: str, reason: str) -> int:
-    """Honest 'no InSAR coverage' result (no_data / no_coverage). Exit 0 so a
-    deterministic geographic miss is not retried three times. M5.1: now emits
-    status=no_data instead of failed."""
-    return _no_data_result(
-        args, start, end, reason_flag="no_coverage",
-        caveats=[
-            reason,
-            "The LiCSAR archive processes Sentinel-1 data over selected "
-            "regions — mainly tectonically and volcanically active areas — "
-            "rather than the whole world, so many places have no frame.",
-        ],
-        progress_msg="no InSAR coverage for this area",
-    )
-
-
 def run_licsbas(args, params: dict) -> int:
     """Drive batch_LiCSBAS.sh end to end, then parse -> result.json (§6.3)."""
     from datetime import date as _date
@@ -420,30 +311,9 @@ def run_licsbas(args, params: dict) -> int:
     candidates = params.get("candidate_frames") or (
         [args.frame or params.get("frame_id")] if (args.frame or params.get("frame_id")) else [])
     candidates = [c for c in candidates if c]
-
-    # M4.1.2: the router found no frame covering this AOI -> answer immediately.
-    if params.get("no_insar_coverage"):
-        return _no_coverage_result(
-            args, start, end,
-            "No InSAR frame in the LiCSAR archive covers this area, so a "
-            "radar time-series could not be computed for it.")
-
-    # M4.1.2: independently drop candidates whose footprint misses the AOI.
-    catalog_path = params.get("licsar_catalog", "/data/licsar_frames.geojson")
-    aoi_bbox = (lon1, lon2, lat1, lat2)
-    covering = [c for c in candidates
-                if _frame_covers_aoi(c, aoi_bbox, catalog_path)]
-    if len(covering) != len(candidates):
-        dropped = [c for c in candidates if c not in covering]
-        print(f"[wrap_licsbas] dropping frame(s) that do not cover the AOI: "
-              f"{dropped}", flush=True)
-    candidates = covering
-
     if not candidates:
-        return _no_coverage_result(
-            args, start, end,
-            "No InSAR frame covering this area was available, so a radar "
-            "time-series could not be computed for it.")
+        print("ERROR no candidate frames provided", file=sys.stderr)
+        return 2
 
     frame = None
     probed = []
@@ -506,53 +376,13 @@ def run_licsbas(args, params: dict) -> int:
                      coh_thre=coh_thre)
 
     progress(5, "starting LiCSBAS pipeline (download + inversion — this is slow)")
-    rc, incoherent = _run_batch(workdir, lambda pct, msg: progress(pct, msg))
-    if incoherent:
-        # M5.1: LiCSBAS aborted at step 11 because every interferogram failed
-        # coherence — the AOI is fully incoherent (water / dense veg / steep
-        # terrain). Measured absence, not a processing error. Exit 0 (no 3x
-        # retry). This is the real La Spezia / Lake Van step-11 case; it fires
-        # BEFORE inversion, so the post-inversion NoValidPixels guard never saw
-        # it.
-        print("[wrap_licsbas] step-11 'all ifgs bad' -> NO_DATA(measured_absence)",
-              flush=True)
-        return _no_data_result(
-            args, start, end, reason_flag="measured_absence",
-            caveats=[
-                "This area has almost no usable radar measurements: every "
-                "interferogram failed coherence checks, so LiCSBAS could not "
-                "form a velocity field. This typically means open water, dense "
-                "vegetation, or steep terrain where Sentinel-1 cannot maintain "
-                "coherence. The absence of a measurable signal is not evidence "
-                "that the ground is stable — it means InSAR could not measure "
-                "it here.",
-            ],
-            progress_msg="no usable radar measurements in this area",
-        )
+    rc = _run_batch(workdir, lambda pct, msg: progress(pct, msg))
     if rc != 0:
         print(f"ERROR batch_LiCSBAS.sh exited {rc}", file=sys.stderr)
         return 4
 
     progress(96, "parsing velocity field")
-    try:
-        R = _read_results(workdir)
-    except NoValidPixels as e:
-        # M5.1: LiCSBAS completed but no coherent scatterers survived in the
-        # AOI — water, dense vegetation, or steep terrain. Honest measured
-        # absence, exit 0 (the La Spezia step-11 case). No wasteful 3x retry.
-        print(f"[wrap_licsbas] {e}: emitting NO_DATA(measured_absence)", flush=True)
-        return _no_data_result(
-            args, start, end, reason_flag="measured_absence",
-            caveats=[
-                "This area has almost no usable radar measurements: after "
-                "processing, no coherent scatterers survived in the drawn AOI. "
-                "This typically means water, dense vegetation, or steep terrain "
-                "where Sentinel-1 cannot maintain coherence. The absence of a "
-                "measurable signal is not evidence that the ground is stable — "
-                "it means InSAR could not measure it here.",
-            ],
-            progress_msg="no usable radar measurements in this area",
-        )
+    R = _read_results(workdir)
 
     png = os.path.join(args.output_dir, "velocity_map.png")
     _render_velocity_png(
@@ -673,14 +503,6 @@ def main() -> int:
         return 0 if result.get("live") else 1
 
     if not frame or not FRAME_RE.match(frame):
-        # M5.1: when the router found no covering LiCSAR frame it sets
-        # no_insar_coverage=True and (correctly) passes no frame_id. Honor that
-        # here — BEFORE the hard error below — so run_licsbas emits a clean
-        # no_data/no_coverage result (exit 0) instead of exit 2. run_licsbas's
-        # own no_insar_coverage handler (§ M4.1.2) is otherwise unreachable
-        # when frame_id is absent, which is exactly the no-coverage case.
-        if params.get("no_insar_coverage"):
-            return run_licsbas(args, params)
         print(f"ERROR no valid frame id (got {frame!r}); "
               "AOI->frame resolution is a backlog item, pass params.frame_id",
               file=sys.stderr)

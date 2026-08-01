@@ -12,9 +12,9 @@ from datetime import date
 from typing import Dict, List, Optional, Union
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .enums import Confidence, Method, ResultStatus
+from .enums import Confidence, Method, NoDataReason, ResultStatus
 
 # Flat scalar values only — no nested objects/arrays inside a stats group.
 StatValue = Union[float, int, str, None]
@@ -53,6 +53,9 @@ class ResultJson(BaseModel):
     query_id: UUID
     method: Method
     status: ResultStatus
+    # M5.1 (§6.3): required iff status == no_data, null otherwise. Coupling is
+    # enforced by _no_data_reason_coupling below.
+    no_data_reason: Optional[NoDataReason] = None
     summary_stats: Dict[str, Dict[str, StatValue]] = Field(
         default_factory=dict,
         description="Per-group flat numeric/string stats, e.g. "
@@ -61,6 +64,20 @@ class ResultJson(BaseModel):
     quality: QualityBlock
     artifacts: List[Artifact] = Field(default_factory=list)
     attribution: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _no_data_reason_coupling(self) -> "ResultJson":
+        """M5.1 (§6.3): no_data_reason present iff status == no_data."""
+        if self.status == ResultStatus.NO_DATA:
+            if self.no_data_reason is None:
+                raise ValueError(
+                    "no_data_reason is required when status == no_data (§6.3)"
+                )
+        elif self.no_data_reason is not None:
+            raise ValueError(
+                "no_data_reason must be null unless status == no_data (§6.3)"
+            )
+        return self
 
     @field_validator("summary_stats")
     @classmethod

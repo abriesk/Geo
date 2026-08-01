@@ -55,50 +55,6 @@ WRAPPER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrappers
 REAL_WRAPPERS = {"wrap_ndvi", "wrap_licsbas", "wrap_egms"}
 
 
-class PermanentTaskError(Exception):
-    """M5.1: a deterministic, non-transient failure that will fail identically
-    on every retry (missing library, unimplemented tier, malformed params).
-    Always routed straight to the DLQ — never retried."""
-
-
-# M5.1: error classification (§5.6/§7). Allowlist policy: only errors we KNOW
-# are transient are retried; everything else goes straight to DLQ. Unknown
-# errors are logged loudly (see the handler) so genuinely-transient classes we
-# have not yet listed can be promoted into this allowlist over time — the
-# strict-by-default safety of an allowlist without permanently burying a
-# transient we did not anticipate.
-_TRANSIENT_EXC_NAMES = frozenset({
-    # network / broker / socket
-    "ConnectionError", "ConnectionResetError", "ConnectionRefusedError",
-    "TimeoutError", "socket.timeout", "BrokenPipeError",
-    "IncompleteRead", "ChunkedEncodingError", "ReadTimeout", "ConnectTimeout",
-    "AMQPConnectionError", "ChannelClosedByBroker", "StreamLostError",
-    # transient filesystem / resource pressure
-    "BlockingIOError",
-})
-# Substrings that mark a transient condition regardless of exception type
-# (e.g. HTTP 429/5xx from CDSE, temporary DNS, disk-full-right-now).
-_TRANSIENT_MSG_MARKERS = (
-    "temporarily", "timed out", "timeout", "connection reset",
-    "connection aborted", "quota exceeded", "rate limit", "too many requests",
-    " 429", " 500", " 502", " 503", " 504",
-    "no space left on device", "resource temporarily unavailable",
-)
-
-
-def is_transient(exc: BaseException) -> bool:
-    """True only for errors on the transient allowlist (retry-worthy).
-    PermanentTaskError is always non-transient. Everything unrecognised is
-    treated as non-transient (allowlist), but the caller logs it loudly."""
-    if isinstance(exc, PermanentTaskError):
-        return False
-    name = type(exc).__name__
-    if name in _TRANSIENT_EXC_NAMES:
-        return True
-    msg = " ".join(str(exc).split()).lower()
-    return any(m in msg for m in _TRANSIENT_MSG_MARKERS)
-
-
 def log(msg: str) -> None:
     print(f"[{ROLE}] {msg}", flush=True)
 
@@ -147,8 +103,7 @@ def run_dummy(task: AnalysisTaskMessage, emit) -> str:
         emit(int(i * 100 / len(steps)), step)
         time.sleep(DUMMY_STEP_SECONDS)
         if task.params.get("simulate_failure") and i == 2:
-            raise RuntimeError(
-                "simulated transient wrapper failure: connection timed out (test hook)")
+            raise RuntimeError("simulated wrapper failure (test hook)")
 
     png_path = out_dir / "velocity_map.png"
     _write_placeholder_png(png_path)
@@ -224,29 +179,6 @@ def run_wrapper_subprocess(task: AnalysisTaskMessage, emit) -> str:
 
 
 def run_task(task: AnalysisTaskMessage, emit) -> str:
-    # M5.1: test hooks live here (not only in run_dummy) because all real
-    # hazards now route to real wrappers, so run_dummy is unreachable via the
-    # query API. simulate_permanent_failure -> PermanentTaskError (DLQ on
-    # attempt 1); simulate_failure -> RuntimeError (transient, retried 3x).
-    if task.params.get("simulate_permanent_failure"):
-        emit(10, "simulated permanent failure (test hook)")
-        raise PermanentTaskError("simulated permanent failure (test hook)")
-    if task.params.get("simulate_failure"):
-        emit(10, "simulated transient failure (test hook)")
-        # Message contains a transient marker ("timed out") so is_transient()
-        # classifies it as retryable — this hook must exercise the 3x retry
-        # path, not the DLQ-on-1 path (that's simulate_permanent_failure).
-        raise RuntimeError(
-            "simulated transient wrapper failure: connection timed out (test hook)")
-
-    if task.name == "wrap_floodpy":
-        # wrap_floodpy belongs on tasks.flood (the flood-worker). If it
-        # reaches the main worker it must NOT be dummied into a fake
-        # 'subsiding' result — that would be a confident lie. Fail so it
-        # dead-letters and the misroute is visible.
-        raise RuntimeError(
-            "wrap_floodpy received on tasks.analysis; it must run on the "
-            "flood-worker via tasks.flood. Refusing to fake a result.")
     if task.name in REAL_WRAPPERS:
         return run_wrapper_subprocess(task, emit)
     return run_dummy(task, emit)
@@ -303,26 +235,11 @@ def handle(connection, channel, method, properties, body: bytes) -> None:
         log(f"task {task.task_id} done -> {result_path}")
     except Exception as e:  # noqa: BLE001
         err_flat = " ".join(str(e).split())[:400]
-        # M5.1: classify. Only allowlisted transient errors are retried; a
-        # deterministic failure is DLQ'd on attempt 1 instead of burning all
-        # MAX_TASK_RETRIES (each retry can be ~20 min of re-download).
-        transient = is_transient(e)
-        exhausted = attempt >= MAX_TASK_RETRIES
-        if not transient:
-            # Loud unclassified log so a genuinely-transient class we have not
-            # yet allowlisted is visible in the DLQ stream and can be promoted.
-            log(f"[classify] NON-TRANSIENT ({type(e).__name__}) -> DLQ on "
-                f"attempt {attempt}: {err_flat}")
-        else:
-            log(f"[classify] transient ({type(e).__name__}) on attempt "
-                f"{attempt}/{MAX_TASK_RETRIES}: {err_flat}")
-
-        if not transient or exhausted:
-            suffix = (f"(non-transient, DLQ on attempt {attempt})"
-                      if not transient else f"(after {attempt} attempts)")
+        log(f"task {task.task_id} failed on attempt {attempt}: {err_flat}")
+        if attempt >= MAX_TASK_RETRIES:
             _publish(channel, RESULTS_QUEUE, ResultMessage(
                 query_id=task.query_id, task_id=task.task_id,
-                status="failed", error=f"{err_flat} {suffix}",
+                status="failed", error=f"{err_flat} (after {attempt} attempts)",
             ).model_dump_json())
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)  # -> DLQ
         else:

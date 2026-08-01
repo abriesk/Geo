@@ -4,5 +4,9 @@ COPY libs/contracts /libs/contracts
 COPY services/downloader/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -e /libs/contracts
 COPY services/downloader/downloader_main.py .
+COPY services/downloader/clms_client.py .
+COPY services/downloader/egms_api.py .
+COPY services/downloader/run_egms.py .
+COPY services/downloader/egms_fetch_one.py .
 ENV SERVICE_ROLE=downloader
 CMD ["python", "downloader_main.py"]

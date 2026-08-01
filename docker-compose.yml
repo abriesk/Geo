@@ -107,6 +107,7 @@ services:
     volumes:
       - ./data:/data
       - ./static:/static:ro
+      - ./secrets:/run/secrets:ro
     depends_on:
       broker:
         condition: service_healthy
@@ -125,6 +126,34 @@ services:
       EXPERT_RAW_PROCESSING: ${EXPERT_RAW_PROCESSING:-false}
     volumes:
       - ./data:/data
+    depends_on:
+      broker:
+        condition: service_healthy
+    restart: unless-stopped
+
+  flood-worker:
+    build:
+      context: .
+      dockerfile: services/flood-worker/Dockerfile
+      args:
+        GPT_HEAP: 4G
+    environment:
+      SERVICE_ROLE: flood-worker
+      AMQP_URL: amqp://geohazard:${RABBITMQ_DEFAULT_PASS}@broker:5672/%2F
+      DATABASE_URL: postgresql://geohazard:${POSTGRES_PASSWORD}@db:5432/geohazard
+      RESULTS_ROOT: /data/results
+      CDSE_USERNAME: ${CDSE_USERNAME:-}
+      CDSE_PASSWORD: ${CDSE_PASSWORD:-}
+      GPTBIN_PATH: /opt/snap/bin/gpt
+      FLOODPY_PYTHON: /opt/conda/envs/floodpy/bin/python
+      FLOODPY_HOME: /opt/FLOODPY
+      CDSAPI_RC: /run/secrets/cdsapirc
+      FLOOD_TIMEOUT_S: ${FLOOD_TIMEOUT_S:-7200}
+      # FLOODPY_RAM_GB: "4"        # optional; else auto-sized from mem_limit
+    volumes:
+      - ./data:/data
+      - ./secrets/cdsapirc:/run/secrets/cdsapirc:ro
+    mem_limit: 16g                 # < host 23G; _safe_cpu_ram budgets from this
     depends_on:
       broker:
         condition: service_healthy
